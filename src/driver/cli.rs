@@ -260,7 +260,8 @@ impl Driver {
                 //      simplify, dce). Single iteration, no expensive analyses.
                 // -O2: Full optimization pipeline (all passes, 3 iterations with
                 //      GVN, LICM, IVSR, if-conversion, inlining, IPCP).
-                // -O3: Same as -O2 (future: more aggressive inlining thresholds).
+                // -O3: Aggressive — more iterations, tighter diminishing-returns
+                //      threshold, more aggressive inlining.
                 //
                 // The `optimize` and `optimize_size` booleans also control predefined
                 // macros (__OPTIMIZE__, __OPTIMIZE_SIZE__), which build systems like
@@ -277,8 +278,14 @@ impl Driver {
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
-                "-O2" | "-O3" => {
+                "-O2" => {
                     self.opt_level = 2;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-O3" => {
+                    self.opt_level = 3;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
