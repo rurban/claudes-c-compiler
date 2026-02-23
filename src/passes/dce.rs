@@ -17,6 +17,7 @@ use crate::ir::reexports::{
     IrFunction,
     Operand,
 };
+use crate::passes::use_def::UseDefInfo;
 
 /// Eliminate dead code in a single function using use-count-based worklist DCE.
 ///
@@ -153,6 +154,104 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
         } else {
             // If source_spans is non-empty but wrong length, clear it to
             // restore the invariant (empty = no debug info for this block).
+            if !block.source_spans.is_empty() && block.source_spans.len() != original_len {
+                block.source_spans.clear();
+            }
+            let mut idx = 0;
+            block.instructions.retain(|_| {
+                let keep = !dead_flags[idx];
+                idx += 1;
+                keep
+            });
+        }
+        total += dead_count;
+    }
+
+    total
+}
+
+/// Eliminate dead code using pre-built UseDefInfo.
+///
+/// Same algorithm as `eliminate_dead_code`, but reuses the shared use-count
+/// and def-loc arrays instead of scanning the function from scratch.
+pub(crate) fn eliminate_dead_code_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> usize {
+    let max_id = usedef.use_count.len().saturating_sub(1);
+    if max_id == 0 && func.blocks.len() <= 1 {
+        return eliminate_dead_code_simple(func, max_id);
+    }
+
+    // Clone use_count into a mutable local — worklist processing decrements counts.
+    let mut use_count = usedef.use_count.clone();
+
+    // Build dead flags and worklist using the shared def_loc.
+    let mut dead: Vec<Vec<bool>> = func.blocks.iter()
+        .map(|b| vec![false; b.instructions.len()])
+        .collect();
+    let mut worklist: Vec<(u32, u32)> = Vec::new();
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if has_side_effects(inst) {
+                continue;
+            }
+            if let Some(dest) = inst.dest() {
+                let id = dest.0 as usize;
+                if id <= max_id && use_count[id] == 0 {
+                    dead[bi][ii] = true;
+                    worklist.push((bi as u32, ii as u32));
+                }
+            }
+        }
+    }
+
+    // Process worklist — use usedef.def_loc for chain-following.
+    while let Some((bi, ii)) = worklist.pop() {
+        let inst = &func.blocks[bi as usize].instructions[ii as usize];
+        inst.for_each_used_value(|id| {
+            let idx = id as usize;
+            if idx < use_count.len() {
+                use_count[idx] = use_count[idx].saturating_sub(1);
+                if use_count[idx] == 0 {
+                    if let Some((dbi, dii)) = usedef.def_loc[idx].as_instruction() {
+                        if !dead[dbi as usize][dii as usize] {
+                            let dinst = &func.blocks[dbi as usize].instructions[dii as usize];
+                            if !has_side_effects(dinst) {
+                                dead[dbi as usize][dii as usize] = true;
+                                worklist.push((dbi, dii));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Sweep — identical to eliminate_dead_code.
+    let mut total = 0;
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        let dead_flags = &dead[bi];
+        let original_len = block.instructions.len();
+
+        let dead_count = dead_flags.iter().filter(|&&d| d).count();
+        if dead_count == 0 {
+            continue;
+        }
+
+        let has_spans = block.source_spans.len() == original_len && !block.source_spans.is_empty();
+        if has_spans {
+            let mut write_idx = 0;
+            for read_idx in 0..original_len {
+                if !dead_flags[read_idx] {
+                    if write_idx != read_idx {
+                        block.instructions.swap(write_idx, read_idx);
+                        block.source_spans.swap(write_idx, read_idx);
+                    }
+                    write_idx += 1;
+                }
+            }
+            block.instructions.truncate(write_idx);
+            block.source_spans.truncate(write_idx);
+        } else {
             if !block.source_spans.is_empty() && block.source_spans.len() != original_len {
                 block.source_spans.clear();
             }

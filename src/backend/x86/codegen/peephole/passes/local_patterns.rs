@@ -488,3 +488,145 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
     }
     changed
 }
+
+// ── XMM-through-accumulator folding ──────────────────────────────────────────
+//
+// Folds `movq %xmm0, %rax` + `movq %rax, <dest>` into `movq %xmm0, <dest>`.
+// The accumulator-based codegen routes FP values through %rax when storing
+// double/float results to stack slots or callee-saved registers. This pattern
+// is safe because `movq %xmm0, <gp_reg>` and `movq %xmm0, <memory>` are both
+// valid x86-64 instructions (SSE2 MOVQ encoding).
+//
+// Also handles `movd %xmm0, %eax` + `movl %eax, <dest>` → `movd %xmm0, <dest>`.
+
+/// Fold `movq %xmm0, %rax; movq %rax, <dest>` into `movq %xmm0, <dest>`.
+///
+/// The accumulator-based codegen routes floating-point values through %rax,
+/// producing two-move chains. This fold eliminates the intermediate step.
+///
+/// Safety: The fold removes the definition of %rax. We must verify that %rax
+/// is dead after the second move (not read before being overwritten or before
+/// a control flow boundary).
+pub(super) fn fold_xmm_through_accumulator(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    const RAX: u8 = 0; // register family 0 = rax/eax/ax/al
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_i = infos[i].trimmed(store.get(i));
+
+        // Match `movq %xmm0, %rax`
+        if trimmed_i != "movq %xmm0, %rax" {
+            i += 1;
+            continue;
+        }
+
+        // Find next non-NOP instruction
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_j = infos[j].trimmed(store.get(j));
+
+        // Match `movq %rax, <dest>` where dest is a register or memory
+        if let Some(dest) = trimmed_j.strip_prefix("movq %rax, ") {
+            let dest = dest.trim();
+            if dest == "%rax" {
+                i += 1;
+                continue;
+            }
+
+            // Check that %rax is dead after line j.
+            // Scan forward from j+1: if %rax is referenced before being
+            // purely overwritten (or before a control flow boundary), the fold
+            // is unsafe.
+            if !is_reg_dead_after(infos, store, j + 1, len, RAX) {
+                i += 1;
+                continue;
+            }
+
+            let new_text = format!("    movq %xmm0, {}", dest);
+            replace_line(store, &mut infos[i], i, new_text);
+            mark_nop(&mut infos[j]);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// Check if a register is dead (not read before being overwritten) starting
+/// from position `start`. Scans at most 16 instructions forward and gives up
+/// conservatively (returns false) at control flow boundaries.
+fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: usize, reg: u8) -> bool {
+    let reg_bit = 1u16 << reg;
+    let mut scanned = 0;
+    let mut k = start;
+    while k < len && scanned < 16 {
+        if infos[k].is_nop() {
+            k += 1;
+            continue;
+        }
+
+        // Control flow boundary: label, jump, conditional jump — conservatively unsafe
+        match infos[k].kind {
+            LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp => return false,
+            // calls clobber rax (caller-saved), so if reg==rax it's dead after call
+            LineKind::Call => return reg == 0,
+            LineKind::Ret => return false,
+            _ => {}
+        }
+
+        let refs_reg = infos[k].reg_refs & reg_bit != 0;
+        if refs_reg {
+            // This line references the register. Check if it's a pure overwrite
+            // (writes the reg without reading it).
+            let dest = super::helpers::get_dest_reg(&infos[k]);
+            if dest == reg {
+                // dest_reg == our reg. But read-modify-write instructions
+                // (addq %rax, ...; subq ..., %rax) also read it.
+                // If it's a simple mov/lea with reg as dest only, it's a pure overwrite.
+                let trimmed = infos[k].trimmed(store.get(k));
+                if trimmed.starts_with("movq ") || trimmed.starts_with("movl ")
+                    || trimmed.starts_with("movb ") || trimmed.starts_with("movw ")
+                    || trimmed.starts_with("leaq ") || trimmed.starts_with("leal ")
+                    || trimmed.starts_with("movabs")
+                    || trimmed.starts_with("xorl %eax, %eax")
+                {
+                    // Pure overwrite — reg is dead here
+                    return true;
+                }
+            }
+            // Referenced but not a pure overwrite → reg is read, fold unsafe
+            return false;
+        }
+
+        // Implicit rax usage by div/mul/cltq etc. that reg_refs might miss
+        if reg == 0 {
+            let trimmed = infos[k].trimmed(store.get(k));
+            if super::helpers::has_implicit_reg_usage(trimmed) {
+                return false;
+            }
+        }
+
+        scanned += 1;
+        k += 1;
+    }
+
+    // Reached scan limit without finding a definitive answer — conservatively unsafe
+    false
+}

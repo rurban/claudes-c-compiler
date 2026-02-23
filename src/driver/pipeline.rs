@@ -243,7 +243,7 @@ impl Driver {
             output_path: "a.out".to_string(),
             output_path_set: false,
             input_files: Vec::new(),
-            opt_level: 2, // All levels run the same optimizations; default to max
+            opt_level: 2, // Default to full optimization
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             verbose: false,

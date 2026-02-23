@@ -597,6 +597,54 @@ fn find_derived_exprs(
         }
     }
 
+    // Also find IV-derived values used directly as GEP offsets (stride = 1).
+    // This handles byte-array patterns like `sieve[j] = 0` where the IV (after
+    // cast to I64) is the GEP offset with no multiplication or shift.
+    // Collect IV-derived value IDs that are already handled by a Mul/Shl above,
+    // so we don't create duplicate reductions.
+    let mut already_reduced: FxHashSet<u32> = FxHashSet::default();
+    for d in &derived {
+        for &(_, _, _, _) in &d.gep_uses {
+            // The Mul/Shl dest values are tracked implicitly; what matters is
+            // the GEP offset values. We need to avoid reducing a GEP whose
+            // offset is already a mul/shl result that we've handled.
+        }
+    }
+    // Actually track which GEPs (by dest) are already reduced
+    for d in &derived {
+        for &(_, _, gdest, _) in &d.gep_uses {
+            already_reduced.insert(gdest.0);
+        }
+    }
+
+    for &bi in loop_body {
+        if bi >= func.blocks.len() {
+            continue;
+        }
+        for (gii, ginst) in func.blocks[bi].instructions.iter().enumerate() {
+            if let Instruction::GetElementPtr {
+                dest: gdest,
+                base,
+                offset: Operand::Value(ov),
+                ..
+            } = ginst
+            {
+                // Skip if this GEP is already reduced by a Mul/Shl pattern
+                if already_reduced.contains(&gdest.0) {
+                    continue;
+                }
+                // Check if the offset value derives from an IV (through Cast/Copy)
+                if let Some(iv_idx) = find_iv(ov.0) {
+                    derived.push(DerivedExpr {
+                        stride: 1,
+                        iv_index: iv_idx,
+                        gep_uses: vec![(bi, gii, *gdest, *base)],
+                    });
+                }
+            }
+        }
+    }
+
     derived
 }
 
