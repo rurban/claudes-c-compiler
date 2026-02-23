@@ -748,7 +748,7 @@ impl Preprocessor {
                 // from within a nested header, since the injected text gets emitted at
                 // the include boundary -- potentially in the middle of an initializer.
                 self.macros.define(MacroDef {
-                    name: "va_start".to_string(),
+                    name: std::rc::Rc::from("va_start"),
                     is_function_like: true,
                     params: vec!["ap".to_string(), "last".to_string()],
                     is_variadic: false,
@@ -756,7 +756,7 @@ impl Preprocessor {
                     body: "__builtin_va_start(ap,last)".to_string(),
                 });
                 self.macros.define(MacroDef {
-                    name: "va_end".to_string(),
+                    name: std::rc::Rc::from("va_end"),
                     is_function_like: true,
                     params: vec!["ap".to_string()],
                     is_variadic: false,
@@ -764,7 +764,7 @@ impl Preprocessor {
                     body: "__builtin_va_end(ap)".to_string(),
                 });
                 self.macros.define(MacroDef {
-                    name: "va_copy".to_string(),
+                    name: std::rc::Rc::from("va_copy"),
                     is_function_like: true,
                     params: vec!["dest".to_string(), "src".to_string()],
                     is_variadic: false,
@@ -775,7 +775,7 @@ impl Preprocessor {
                 // It's handled by the parser as a special built-in, so we define
                 // the macro to expand to __builtin_va_arg which the lexer recognizes.
                 self.macros.define(MacroDef {
-                    name: "va_arg".to_string(),
+                    name: std::rc::Rc::from("va_arg"),
                     is_function_like: true,
                     params: vec!["ap".to_string(), "type".to_string()],
                     is_variadic: false,

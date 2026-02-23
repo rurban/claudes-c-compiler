@@ -8,6 +8,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::macro_defs::{MacroDef, MacroTable, parse_define};
 use super::conditionals::{ConditionalStack, evaluate_condition};
@@ -17,7 +18,7 @@ use super::text_processing::{strip_line_comment, split_first_word};
 
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
 /// Used to remove duplicate names from nested macro expansions.
-fn dedup_macro_names(names: Vec<String>) -> Vec<String> {
+fn dedup_macro_names(names: Vec<Rc<str>>) -> Vec<Rc<str>> {
     let mut unique = Vec::new();
     for name in names {
         if !unique.contains(&name) {
@@ -114,7 +115,7 @@ pub struct Preprocessor {
     pub(super) include_guard_macros: FxHashMap<PathBuf, String>,
     /// Reusable FxHashSet for directive-level macro expansion (handle_if, handle_elif,
     /// handle_line_directive, #error). Avoids allocating a new FxHashSet per directive.
-    directive_expanding: FxHashSet<String>,
+    directive_expanding: FxHashSet<Rc<str>>,
     /// Macro expansion metadata: maps preprocessed output line numbers to
     /// the macros expanded on that line. Populated during preprocessing and
     /// passed to the SourceManager for diagnostic rendering.
@@ -228,7 +229,7 @@ impl Preprocessor {
         // This set tracks which macros are currently being expanded (to prevent
         // infinite recursion per C11 §6.10.3.4). It's cleared before each use
         // by expand_line_reuse().
-        let mut expanding = crate::common::fx_hash::FxHashSet::default();
+        let mut expanding: crate::common::fx_hash::FxHashSet<Rc<str>> = crate::common::fx_hash::FxHashSet::default();
 
         // Enable macro expansion tracking for diagnostic "in expansion of macro" notes.
         // Only track at top level (not within included files) to avoid duplicate entries.
@@ -488,7 +489,7 @@ impl Preprocessor {
         pending_line: &mut String,
         pending_newlines: &mut usize,
         output: &mut String,
-        expanding: &mut crate::common::fx_hash::FxHashSet<String>,
+        expanding: &mut crate::common::fx_hash::FxHashSet<Rc<str>>,
     ) {
         if pending_line.is_empty() {
             if Self::has_unbalanced_parens(line) {
@@ -617,7 +618,7 @@ impl Preprocessor {
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
         self.macros.define(MacroDef {
-            name: "__BASE_FILE__".to_string(),
+            name: Rc::from("__BASE_FILE__"),
             is_function_like: false,
             params: Vec::new(),
             is_variadic: false,
@@ -688,7 +689,7 @@ impl Preprocessor {
     /// Takes a name and value (e.g., name="FOO", value="1").
     pub fn define_macro(&mut self, name: &str, value: &str) {
         self.macros.define(MacroDef {
-            name: name.to_string(),
+            name: Rc::from(name),
             is_function_like: false,
             params: Vec::new(),
             is_variadic: false,

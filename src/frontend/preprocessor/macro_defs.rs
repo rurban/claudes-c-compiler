@@ -13,6 +13,7 @@
 //! literals are copied verbatim without interpretation.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -57,7 +58,7 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
 #[derive(Debug, Clone)]
 pub struct MacroDef {
     /// Name of the macro
-    pub name: String,
+    pub name: Rc<str>,
     /// Whether this is a function-like macro
     pub is_function_like: bool,
     /// Parameters for function-like macros
@@ -105,7 +106,7 @@ fn strip_blue_paint(s: &str) -> std::borrow::Cow<'_, str> {
 /// Stores all macro definitions and handles expansion.
 #[derive(Debug, Clone)]
 pub struct MacroTable {
-    macros: FxHashMap<String, MacroDef>,
+    macros: FxHashMap<Rc<str>, MacroDef>,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
     /// Cached __LINE__ value. Updated by set_line(), expanded specially in expand_text.
@@ -114,7 +115,7 @@ pub struct MacroTable {
     /// Used by the preprocessor to build macro expansion metadata for diagnostics
     /// ("in expansion of macro 'X'" notes). Wrapped in RefCell because expansion
     /// methods take &self.
-    expanded_macros: std::cell::RefCell<Vec<String>>,
+    expanded_macros: std::cell::RefCell<Vec<Rc<str>>>,
     /// Whether to track macro expansions (disabled by default for performance;
     /// enabled by the preprocessor for the main expansion pass).
     track_expansions: Cell<bool>,
@@ -140,7 +141,7 @@ impl MacroTable {
 
     /// Define a new macro.
     pub fn define(&mut self, def: MacroDef) {
-        self.macros.insert(def.name.clone(), def);
+        self.macros.insert(Rc::clone(&def.name), def);
     }
 
     /// Undefine a macro.
@@ -187,8 +188,8 @@ impl MacroTable {
         if let Some(existing) = self.macros.get_mut("__FILE__") {
             existing.body = body;
         } else {
-            self.macros.insert("__FILE__".to_string(), MacroDef {
-                name: "__FILE__".to_string(),
+            self.macros.insert(Rc::from("__FILE__"), MacroDef {
+                name: Rc::from("__FILE__"),
                 is_function_like: false,
                 params: Vec::new(),
                 is_variadic: false,
@@ -213,14 +214,14 @@ impl MacroTable {
 
     /// Take the list of macro names expanded during the last expand_line_reuse() call.
     /// Returns an empty Vec if tracking is disabled or no macros were expanded.
-    pub fn take_expanded_macros(&self) -> Vec<String> {
+    pub fn take_expanded_macros(&self) -> Vec<Rc<str>> {
         std::mem::take(&mut *self.expanded_macros.borrow_mut())
     }
 
     /// Expand macros in a line of text.
     /// Returns the expanded text.
     pub fn expand_line(&self, line: &str) -> String {
-        let mut expanding = FxHashSet::default();
+        let mut expanding: FxHashSet<Rc<str>> = FxHashSet::default();
         self.expand_line_reuse(line, &mut expanding)
     }
 
@@ -228,7 +229,7 @@ impl MacroTable {
     /// The set is cleared before use. This avoids allocating a new FxHashSet
     /// for every line (the previous per-line allocation was a measurable
     /// overhead when preprocessing kernel headers with thousands of lines).
-    pub fn expand_line_reuse(&self, line: &str, expanding: &mut FxHashSet<String>) -> String {
+    pub fn expand_line_reuse(&self, line: &str, expanding: &mut FxHashSet<Rc<str>>) -> String {
         expanding.clear();
         if self.track_expansions.get() {
             self.expanded_macros.borrow_mut().clear();
@@ -282,7 +283,7 @@ impl MacroTable {
         mut expanded: String,
         bytes: &[u8],
         mut i: usize,
-        expanding: &mut FxHashSet<String>,
+        expanding: &mut FxHashSet<Rc<str>>,
     ) -> (String, usize) {
         let len = bytes.len();
         loop {
@@ -324,7 +325,7 @@ impl MacroTable {
         expanded: &str,
         bytes: &[u8],
         i: usize,
-        expanding: &mut FxHashSet<String>,
+        expanding: &mut FxHashSet<Rc<str>>,
     ) -> Option<(String, usize)> {
         let len = bytes.len();
         let expanded_trimmed = expanded.trim();
@@ -359,7 +360,7 @@ impl MacroTable {
     /// currently being expanded to prevent infinite recursion.
     ///
     /// Operates on bytes for performance: avoids allocating Vec<char>.
-    fn expand_text(&self, text: &str, expanding: &mut FxHashSet<String>) -> String {
+    fn expand_text(&self, text: &str, expanding: &mut FxHashSet<Rc<str>>) -> String {
         let mut result = String::with_capacity(text.len());
         let bytes = text.as_bytes();
         let len = bytes.len();
@@ -427,7 +428,7 @@ impl MacroTable {
 
     /// Process an identifier: expand macros, handle builtins, or copy verbatim.
     fn expand_identifier(&self, text: &str, bytes: &[u8], start: usize,
-                         result: &mut String, expanding: &mut FxHashSet<String>) -> usize {
+                         result: &mut String, expanding: &mut FxHashSet<Rc<str>>) -> usize {
         let len = bytes.len();
         let mut i = start + 1;
         while i < len && is_ident_cont_byte(bytes[i]) {
@@ -534,10 +535,10 @@ impl MacroTable {
     /// Expand a macro invocation (function-like or object-like).
     fn expand_macro_invocation(&self, _text: &str, bytes: &[u8], i: usize, ident: &str,
                                mac: &MacroDef, result: &mut String,
-                               expanding: &mut FxHashSet<String>) -> usize {
+                               expanding: &mut FxHashSet<Rc<str>>) -> usize {
         // Record this macro expansion for diagnostic tracing
         if self.track_expansions.get() {
-            self.expanded_macros.borrow_mut().push(ident.to_string());
+            self.expanded_macros.borrow_mut().push(Rc::clone(&mac.name));
         }
         let len = bytes.len();
         if mac.is_function_like {
@@ -569,7 +570,7 @@ impl MacroTable {
         }
 
         // Object-like macro
-        expanding.insert(ident.to_string());
+        expanding.insert(Rc::clone(&mac.name));
         let expanded = self.expand_text(&mac.body, expanding);
         expanding.remove(ident);
 
@@ -728,7 +729,7 @@ impl MacroTable {
         &self,
         mac: &MacroDef,
         args: &[String],
-        expanding: &mut FxHashSet<String>,
+        expanding: &mut FxHashSet<Rc<str>>,
     ) -> (String, bool) {
         // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
         // Per the standard, arguments adjacent to # or ## use the RAW (unexpanded)
@@ -1346,7 +1347,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
     while i < len && is_ident_cont_byte(bytes[i]) {
         i += 1;
     }
-    let name = bytes_to_str(bytes, 0, i).to_string();
+    let name: Rc<str> = Rc::from(bytes_to_str(bytes, 0, i));
 
     // Check if function-like (opening paren immediately after name, no space)
     if i < len && bytes[i] == b'(' {

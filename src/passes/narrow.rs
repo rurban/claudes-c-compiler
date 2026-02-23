@@ -722,7 +722,7 @@ mod tests {
     use crate::ir::reexports::{BasicBlock, BlockId, Terminator, Value};
 
     fn make_func_with_blocks(blocks: Vec<BasicBlock>) -> IrFunction {
-        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new("test".into(), IrType::I32, vec![], false);
         func.blocks = blocks;
         func.next_value_id = 100;
         func

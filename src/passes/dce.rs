@@ -402,7 +402,7 @@ mod tests {
 
     fn make_simple_func() -> IrFunction {
         // Function with: %0 = alloca i32, %1 = add 3, 4 (dead), store 42 to %0, load from %0
-        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new("test".into(), IrType::I32, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
@@ -436,12 +436,12 @@ mod tests {
     #[test]
     fn test_side_effects_preserved() {
         // Calls should never be removed even if result is unused
-        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        let mut func = IrFunction::new("test".into(), IrType::Void, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
                 Instruction::Call {
-                    func: "printf".to_string(),
+                    func: "printf".into(),
                     info: CallInfo {
                         dest: Some(Value(0)),
                         args: vec![],
@@ -474,7 +474,7 @@ mod tests {
         // %3 = add %2, 4  (dead, not used at all)
         // return void
         // All of %1, %2, %3 should be removed in a single pass.
-        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        let mut func = IrFunction::new("test".into(), IrType::Void, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
@@ -517,7 +517,7 @@ mod tests {
         //   loop_header: phi V = [entry: Const(0), backedge: V]
         // V is only used by itself, so it's dead.
         // Without the fix, the self-reference keeps use_count=1.
-        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new("test".into(), IrType::I32, vec![], false);
 
         // Block 0 (entry): branch to loop header
         func.blocks.push(BasicBlock {
