@@ -8,8 +8,10 @@
 //!   Produces fast compiles and debuggable output.
 //! - `-O1`: Basic — cfg_simplify, copy_prop, constant_fold, simplify, narrow, dce.
 //!   Single iteration, no expensive analyses (GVN, LICM, IVSR, inlining).
-//! - `-O2`/`-O3`/`-Os`/`-Oz`: Full pipeline — all passes, up to 3 iterations,
+//! - `-O2`/`-Os`/`-Oz`: Full pipeline — all passes, up to 3 iterations,
 //!   including inlining, GVN, LICM, IVSR, if-conversion, and IPCP.
+//! - `-O3`: Aggressive — same passes as -O2 but with more iterations (5),
+//!   a tighter diminishing-returns threshold, and more aggressive inlining.
 
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -26,6 +28,7 @@ pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod narrow;
 mod resolve_asm;
+pub(crate) mod sccp;
 pub(crate) mod simplify;
 pub(crate) mod use_def;
 
@@ -233,6 +236,7 @@ struct DisabledPasses {
     narrow: bool,
     simplify: bool,
     constfold: bool,
+    sccp: bool,
     gvn: bool,
     licm: bool,
     ifconv: bool,
@@ -248,6 +252,7 @@ impl DisabledPasses {
             narrow: disabled.contains("narrow"),
             simplify: disabled.contains("simplify"),
             constfold: disabled.contains("constfold"),
+            sccp: disabled.contains("sccp"),
             gvn: disabled.contains("gvn"),
             licm: disabled.contains("licm"),
             ifconv: disabled.contains("ifconv"),
@@ -298,9 +303,13 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
 ///   optimizations (inlining, IPCP). Good balance of compile speed and
 ///   code quality.
 ///
-/// - `opt_level >= 2`: Full pipeline with all passes, up to 3 iterations,
+/// - `opt_level == 2`: Full pipeline with all passes, up to 3 iterations,
 ///   dirty-tracking, diminishing-returns early exit, and interprocedural
 ///   constant propagation. Maximum optimization.
+///
+/// - `opt_level >= 3`: Aggressive. Same passes as -O2 but with 5 iterations,
+///   a tighter diminishing-returns threshold (2% vs 5%), and more aggressive
+///   inlining budgets. Trades compile time for code quality.
 ///
 /// The `optimize` and `optimize_size` booleans on the Driver still control the
 /// `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` predefined macros, which build systems
@@ -358,8 +367,9 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
     }
 
     // -O2 and above: full pipeline.
+    // -O3 gets more iterations and a tighter diminishing-returns threshold.
 
-    let iterations = 3;
+    let iterations = if opt_level >= 3 { 5 } else { 3 };
     let num_funcs = module.functions.len();
     let mut dirty = vec![true; num_funcs];
     let dis = DisabledPasses::from_env(&disabled);
@@ -488,6 +498,21 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
             total_changes_excl_dce += n;
         }
 
+        // Phase 4b: Sparse Conditional Constant Propagation (SCCP).
+        // Propagates constants across blocks through phi nodes, eliminates dead
+        // branches, and removes unreachable code. Strictly more powerful than
+        // intra-block constfold. Piggybacks on constfold's slot 4 to avoid
+        // renumbering all pass indices.
+        // Upstream: same as constfold (cfg_simplify, copy_prop, narrow, simplify, constfold)
+        if !dis.sccp && should_run!(4, 0, 1, 2, 3, 4) {
+            let n = timed_pass!("sccp", run_on_visited_with_usedef(
+                module, &dirty, &mut changed, &mut usedef_cache,
+                sccp::run_sccp_with_usedef));
+            cur_pass_changes[4] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phases 5-6a: GVN + LICM + IVSR with shared CFG analysis.
         //
         // These three passes all need CFG + dominator + loop analysis. Since GVN
@@ -536,6 +561,12 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
             total_changes += n;
             total_changes_excl_dce += n;
         }
+
+        // Invalidate the usedef_cache before DCE. Passes between the last
+        // usedef-consuming pass (narrow/SCCP) and DCE (GVN, LICM, IVSR,
+        // if_convert, copy_prop2) may have modified the IR without updating
+        // the cache, leaving stale entries that would cause incorrect DCE.
+        usedef_cache.iter_mut().for_each(|c| *c = None);
 
         // Phase 9: Dead code elimination
         // Upstream: gvn, licm, if_convert, copy_prop2 (produced dead instructions)
@@ -612,9 +643,10 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
         // inlined cpucap_is_possible -> alternative_has_cap_unlikely) need at
         // least 2 iterations to complete: iter0 for initial folding, iter1 for
         // propagating results through the control flow.
-        const DIMINISHING_RETURNS_FACTOR: usize = 20; // 1/20 = 5% threshold
+        // -O3 uses a tighter threshold (2%) to squeeze out more optimization.
+        let diminishing_returns_factor: usize = if opt_level >= 3 { 50 } else { 20 };
         if iter > 1 && ipcp_changes == 0 && iter0_total_changes > 0
-            && total_changes_excl_dce * DIMINISHING_RETURNS_FACTOR < iter0_total_changes
+            && total_changes_excl_dce * diminishing_returns_factor < iter0_total_changes
         {
             break;
         }
