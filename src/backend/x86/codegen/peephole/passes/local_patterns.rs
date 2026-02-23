@@ -296,7 +296,20 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 ext_idx += 1;
                 continue;
             }
-            break;
+            // Skip non-rax-writing instructions: these don't change %rax,
+            // so an extension on %rax further ahead is still redundant.
+            // This catches patterns like: movsbq (%r15), %rax; movq %rax, %r13; movsbq %al, %rax
+            match infos[ext_idx].kind {
+                LineKind::Other { dest_reg } if dest_reg != 0 => {
+                    ext_idx += 1;
+                    continue;
+                }
+                LineKind::LoadRbp { reg, .. } if reg != 0 => {
+                    ext_idx += 1;
+                    continue;
+                }
+                _ => break,
+            }
         }
 
         if ext_idx < len && !infos[ext_idx].is_nop() {
@@ -310,7 +323,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 ExtKind::MovslqEaxRax => matches!(prev_ext, ExtKind::ProducerMovslqToRax | ExtKind::MovslqEaxRax),
                 ExtKind::Cltq => matches!(prev_ext,
                     ExtKind::ProducerMovslqToRax | ExtKind::ProducerMovqConstRax |
-                    ExtKind::MovslqEaxRax | ExtKind::Cltq),
+                    ExtKind::MovslqEaxRax | ExtKind::Cltq |
+                    // Zero-extend producers always produce values with bit 31 = 0,
+                    // so cltq (sign-extend from 32 to 64) is a no-op after them.
+                    ExtKind::ProducerMovzbToEax | ExtKind::ProducerMovzwToEax |
+                    ExtKind::ProducerMovzbqToRax | ExtKind::ProducerMovzwqToRax |
+                    ExtKind::MovzbqAlRax | ExtKind::MovzwqAxRax),
                 ExtKind::MovlEaxEax => matches!(prev_ext,
                     ExtKind::ProducerArith32 | ExtKind::ProducerMovlToEax |
                     ExtKind::ProducerMovzbToEax | ExtKind::ProducerMovzbqToRax |
@@ -629,4 +647,99 @@ fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: u
 
     // Reached scan limit without finding a definitive answer — conservatively unsafe
     false
+}
+
+// ── Address-through-secondary register folding ──────────────────────────────
+//
+// Folds `movq %rN, %rcx; <mem-op> (%rcx), ...` into `<mem-op> (%rN), ...`
+// and NOP's the movq. The accumulator-based codegen routes all pointer
+// dereferences through %rcx (the secondary register), producing two-instruction
+// chains where a single instruction suffices.
+//
+// Handles both loads and stores through (%rcx), including displacement forms
+// like `N(%rcx)`:
+//   movq %r15, %rcx; movsbq (%rcx), %rax  → movsbq (%r15), %rax
+//   movq %rax, %rcx; movq (%rcx), %rax    → movq (%rax), %rax
+//   movq %r15, %rcx; movb %dl, (%rcx)     → movb %dl, (%r15)
+//   movq %r14, %rcx; leaq 8(%rcx), %rax   → leaq 8(%r14), %rax
+//
+// Safety: the fold removes the definition of %rcx. We verify that %rcx is
+// dead after the memory operation (not read before being overwritten).
+// We also verify %rcx is not used as a register operand (outside parentheses)
+// in the memory instruction.
+
+pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    const RCX: u8 = 1; // register family 1 = rcx/ecx/cx/cl
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_i = infos[i].trimmed(store.get(i));
+
+        // Match: movq %rN, %rcx (where %rN is a GP register, not %rcx itself)
+        let src_reg = match trimmed_i.strip_prefix("movq ") {
+            Some(rest) => match rest.strip_suffix(", %rcx") {
+                Some(src) if src.starts_with('%') && src != "%rcx" => {
+                    let fam = register_family_fast(src);
+                    if !is_valid_gp_reg(fam) || fam == RCX {
+                        i += 1;
+                        continue;
+                    }
+                    src
+                }
+                _ => { i += 1; continue; }
+            },
+            None => { i += 1; continue; }
+        };
+
+        // Find next non-NOP instruction
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_j = infos[j].trimmed(store.get(j));
+
+        // Check that the instruction uses (%rcx) as a memory operand
+        // (contains "%rcx)" as a substring — covers (%rcx), N(%rcx), etc.)
+        if !trimmed_j.contains("%rcx)") {
+            i += 1;
+            continue;
+        }
+
+        // Trial replacement: replace %rcx) with %src) in the instruction text.
+        // Then verify %rcx doesn't appear elsewhere (as a non-memory operand).
+        let new_instr = trimmed_j.replace("%rcx)", &format!("{})", src_reg));
+        if new_instr.contains("%rcx") || new_instr.contains("%ecx")
+            || new_instr.contains("%cx") || new_instr.contains("%cl")
+        {
+            // %rcx still appears — used as a register operand too, can't fold
+            i += 1;
+            continue;
+        }
+
+        // Check that %rcx is dead after the memory instruction
+        if !is_reg_dead_after(infos, store, j + 1, len, RCX) {
+            i += 1;
+            continue;
+        }
+
+        // Safe to fold: NOP the movq, rewrite the memory instruction
+        mark_nop(&mut infos[i]);
+        let new_text = format!("    {}", new_instr);
+        replace_line(store, &mut infos[j], j, new_text);
+        changed = true;
+        i = j + 1;
+    }
+    changed
 }
