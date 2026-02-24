@@ -1997,6 +1997,242 @@ pub(super) fn fold_accumulator_routing(store: &mut LineStore, infos: &mut [LineI
     changed
 }
 
+// ── Load destination redirect ──────────────────────────────────────────────
+//
+// CCC routes loads through %rax (the accumulator) before copying to the
+// real destination, producing patterns like:
+//
+//   movsbq (%r15), %rax      ; load to temp
+//   movq %rax, %r13          ; copy temp to dest
+//   testq %rax, %rax         ; use temp (optional)
+//
+// When %rax (temp) is dead after the use(s), we can redirect the load
+// directly to %r13 and rewrite later uses:
+//
+//   movsbq (%r15), %r13
+//   testq %r13, %r13
+//
+// This saves 1 instruction per occurrence.
+
+pub(super) fn redirect_load_destination(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Match: <load> ..., %rT  where load is from memory (contains parentheses)
+        // Load instructions: movq, movl, movsbq, movsbl, movslq, movzbl, movzbq, movzwl, movzwq
+        if let LineKind::Other { dest_reg: temp_reg } = infos[i].kind {
+            if !is_valid_gp_reg(temp_reg) || temp_reg == 4 || temp_reg == 5 {
+                i += 1;
+                continue;
+            }
+
+            let trimmed_i = infos[i].trimmed(store.get(i)).to_string();
+
+            // Must be a load instruction (has memory operand with parentheses)
+            let is_load = trimmed_i.contains('(') && (
+                trimmed_i.starts_with("movq ") || trimmed_i.starts_with("movl ") ||
+                trimmed_i.starts_with("movsbq ") || trimmed_i.starts_with("movsbl ") ||
+                trimmed_i.starts_with("movslq ") || trimmed_i.starts_with("movzbl ") ||
+                trimmed_i.starts_with("movzbq ") || trimmed_i.starts_with("movzwl ") ||
+                trimmed_i.starts_with("movzwq ") || trimmed_i.starts_with("movb ") ||
+                trimmed_i.starts_with("movw ")
+            );
+            if !is_load {
+                i += 1;
+                continue;
+            }
+
+            let temp_64 = REG_NAMES[0][temp_reg as usize];
+
+            // The temp register must NOT appear in the source operand (address computation).
+            // e.g., movq (%rax), %rax  — can't redirect because rax is used in the address.
+            if let Some(comma_pos) = trimmed_i.rfind(", ") {
+                let src_part = &trimmed_i[..comma_pos];
+                let mut temp_in_src = false;
+                for size_idx in 0..4 {
+                    if src_part.contains(REG_NAMES[size_idx][temp_reg as usize]) {
+                        temp_in_src = true;
+                        break;
+                    }
+                }
+                if temp_in_src {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+
+            // Find next non-NOP: should be movq %rT, %rN
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            let trimmed_j = infos[j].trimmed(store.get(j));
+            let expected_prefix = format!("movq {}, ", temp_64);
+            let dest_fam;
+            if let Some(dest_str) = trimmed_j.strip_prefix(expected_prefix.as_str()) {
+                let dest_str = dest_str.trim();
+                if !dest_str.starts_with('%') || dest_str.contains('(') {
+                    i += 1;
+                    continue;
+                }
+                dest_fam = register_family_fast(dest_str);
+                if !is_valid_gp_reg(dest_fam) || dest_fam == temp_reg
+                    || dest_fam == 4 || dest_fam == 5
+                {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+
+            // Now check if there are 0-2 more uses of temp_reg between j+1 and the
+            // point where it's dead. We collect these uses and rewrite them.
+            // We scan forward from j+1 looking for:
+            //  - uses of temp_reg that we can rewrite to dest_fam
+            //  - the point where temp_reg is overwritten or dead
+            // We limit to 3 additional uses max for safety.
+            let mut uses: Vec<usize> = Vec::new();
+            let mut scan_ok = true;
+            let mut k = j + 1;
+            let scan_limit = (j + 8).min(len);
+            while k < scan_limit {
+                if infos[k].is_nop() {
+                    k += 1;
+                    continue;
+                }
+                // Stop at control flow barriers
+                match infos[k].kind {
+                    LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect |
+                    LineKind::CondJmp | LineKind::Call | LineKind::Ret => break,
+                    _ => {}
+                }
+
+                let refs_temp = infos[k].reg_refs & (1u16 << temp_reg) != 0;
+                let refs_dest = infos[k].reg_refs & (1u16 << dest_fam) != 0;
+
+                if refs_temp {
+                    // Check if this instruction writes dest_fam — conflict
+                    if refs_dest {
+                        // Both temp and dest referenced — not safe to redirect
+                        scan_ok = false;
+                        break;
+                    }
+
+                    let dest_k = super::helpers::get_dest_reg(&infos[k]);
+                    if dest_k == temp_reg {
+                        // Temp is overwritten here — done scanning
+                        break;
+                    }
+
+                    // temp_reg is used (read) — we can potentially rewrite
+                    if uses.len() >= 3 {
+                        scan_ok = false;
+                        break;
+                    }
+                    // Make sure the instruction doesn't have implicit reg usage
+                    let trimmed_k = infos[k].trimmed(store.get(k));
+                    if super::helpers::has_implicit_reg_usage(trimmed_k) {
+                        scan_ok = false;
+                        break;
+                    }
+                    uses.push(k);
+                    k += 1;
+                    continue;
+                }
+
+                // Check if this instruction writes dest_fam — conflict
+                let dest_k = super::helpers::get_dest_reg(&infos[k]);
+                if dest_k == dest_fam {
+                    // dest is overwritten before temp is dead — can't redirect
+                    scan_ok = false;
+                    break;
+                }
+
+                k += 1;
+            }
+
+            if !scan_ok {
+                i += 1;
+                continue;
+            }
+
+            // Check that temp_reg is dead after all the uses we found
+            let check_pos = if uses.is_empty() { j + 1 } else { uses[uses.len() - 1] + 1 };
+            if !is_reg_dead_after_ext(infos, store, check_pos, len, temp_reg, &targets) {
+                i += 1;
+                continue;
+            }
+
+            // Also check that dest_fam is NOT read between j+1 and the last use
+            // (since we're moving its definition earlier)
+            if !uses.is_empty() {
+                let mut dest_conflict = false;
+                let mut m = j + 1;
+                while m <= uses[uses.len() - 1] {
+                    if infos[m].is_nop() {
+                        m += 1;
+                        continue;
+                    }
+                    if infos[m].reg_refs & (1u16 << dest_fam) != 0 {
+                        // Check if this is one of our use-sites that we're rewriting
+                        if !uses.contains(&m) {
+                            dest_conflict = true;
+                            break;
+                        }
+                    }
+                    m += 1;
+                }
+                if dest_conflict {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Safe to redirect. Rewrite:
+            // 1. Load instruction: change destination from temp to dest
+            let new_load = super::helpers::replace_reg_family(&trimmed_i, temp_reg, dest_fam);
+            let new_load = format!("    {}", new_load);
+            replace_line(store, &mut infos[i], i, new_load);
+
+            // 2. NOP the movq %rT, %rN
+            mark_nop(&mut infos[j]);
+
+            // 3. Rewrite uses of temp_reg to dest_fam
+            for &u in &uses {
+                let trimmed_u = infos[u].trimmed(store.get(u)).to_string();
+                let new_text = super::helpers::replace_reg_family(&trimmed_u, temp_reg, dest_fam);
+                let new_text = format!("    {}", new_text);
+                replace_line(store, &mut infos[u], u, new_text);
+            }
+
+            changed = true;
+            i = if uses.is_empty() { j + 1 } else { uses[uses.len() - 1] + 1 };
+            continue;
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 // ── Increment-in-place fold ─────────────────────────────────────────────────
 //
 // CCC's codegen produces three-instruction sequences to modify a value in a
