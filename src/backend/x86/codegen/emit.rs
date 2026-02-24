@@ -497,6 +497,62 @@ impl X86Codegen {
         self.state.reg_cache.set_acc(dest.0, false);
     }
 
+    /// Load an operand into an arbitrary named register (e.g. "rdi", "rsi", "r8").
+    /// For register-allocated values, emits a direct reg-to-reg move (or nothing
+    /// if the value is already in the target). For constants, emits an immediate
+    /// load. For stack values, emits a movq/leaq from the stack slot.
+    /// This avoids the accumulator-routing pattern of operand_to_rax + movq rax, target.
+    pub(super) fn operand_to_named_reg(&mut self, op: &Operand, target: &str) {
+        match op {
+            Operand::Const(c) => {
+                let target_32 = reg_name_to_32(target);
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    IrConst::I16(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    IrConst::I32(v) if *v == 0 => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    IrConst::I64(0) => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    IrConst::I8(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target),
+                    IrConst::I16(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target),
+                    IrConst::I32(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target),
+                    IrConst::I64(v) => {
+                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", *v, target);
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", *v, target);
+                        }
+                    }
+                    IrConst::Zero => self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    _ => {
+                        // For float/i128 constants, fall back to loading to rax and moving
+                        self.operand_to_rax(op);
+                        if target != "rax" {
+                            self.state.out.emit_instr_reg_reg("    movq", "rax", target);
+                        }
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                // Check register allocation: direct reg-to-reg
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let reg_name = phys_reg_name(reg);
+                    if reg_name != target {
+                        self.state.out.emit_instr_reg_reg("    movq", reg_name, target);
+                    }
+                    // If already in target register, nothing to do
+                } else if self.state.get_slot(v.0).is_some() {
+                    self.value_to_reg(v, target);
+                } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
+                    if target != "rax" {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", target);
+                    }
+                } else {
+                    let target_32 = reg_name_to_32(target);
+                    self.state.out.emit_instr_reg_reg("    xorl", target_32, target_32);
+                }
+            }
+        }
+    }
+
     /// Load an operand directly into %rcx, avoiding the push/pop pattern.
     /// This is the key optimization: instead of loading to rax, pushing, loading
     /// the other operand to rax, moving rax->rcx, then popping rax, we load

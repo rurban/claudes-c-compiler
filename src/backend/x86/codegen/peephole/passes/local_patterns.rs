@@ -431,8 +431,10 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
 
     let mut i = 0;
     while i + 1 < len {
-        // Look for ProducerMovqRegToRax
-        if infos[i].ext_kind != ExtKind::ProducerMovqRegToRax {
+        // Look for ProducerMovqRegToRax or ProducerMovqMemToRax
+        let is_reg_src = infos[i].ext_kind == ExtKind::ProducerMovqRegToRax;
+        let is_mem_src = infos[i].ext_kind == ExtKind::ProducerMovqMemToRax;
+        if !is_reg_src && !is_mem_src {
             i += 1;
             continue;
         }
@@ -458,8 +460,52 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
 
-        // Extract source register family from the movq instruction
         let movq_line = infos[i].trimmed(store.get(i));
+
+        if is_mem_src {
+            // Memory source: movq N(%rbp), %rax + cltq -> movslq N(%rbp), %rax
+            // Extract the memory operand (everything between "movq " and ", %rax")
+            let mem_operand = if let Some(rest) = movq_line.strip_prefix("movq ") {
+                if let Some((src, _)) = rest.rsplit_once(", %rax") {
+                    Some(src.trim().to_string())
+                } else { None }
+            } else { None };
+
+            if let Some(mem_op) = mem_operand {
+                let new_text = match next_ext {
+                    ExtKind::MovslqEaxRax | ExtKind::Cltq => {
+                        // movq N(%rbp), %rax + cltq -> movslq N(%rbp), %rax
+                        format!("    movslq {}, %rax", mem_op)
+                    }
+                    ExtKind::MovlEaxEax => {
+                        // movq N(%rbp), %rax + movl %eax, %eax -> movl N(%rbp), %eax
+                        format!("    movl {}, %eax", mem_op)
+                    }
+                    ExtKind::MovzbqAlRax => {
+                        // movq N(%rbp), %rax + movzbq %al, %rax -> movzbl N(%rbp), %eax
+                        format!("    movzbl {}, %eax", mem_op)
+                    }
+                    ExtKind::MovzwqAxRax => {
+                        // movq N(%rbp), %rax + movzwq %ax, %rax -> movzwl N(%rbp), %eax
+                        format!("    movzwl {}, %eax", mem_op)
+                    }
+                    ExtKind::MovsbqAlRax => {
+                        // movq N(%rbp), %rax + movsbq %al, %rax -> movsbl N(%rbp), %eax
+                        format!("    movsbq {}, %rax", mem_op)
+                    }
+                    _ => unreachable!(),
+                };
+                replace_line(store, &mut infos[i], i, new_text);
+                mark_nop(&mut infos[j]);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Register source: extract source register family from the movq instruction
         let src_family = if let Some(rest) = movq_line.strip_prefix("movq ") {
             if let Some((src, _dst)) = rest.split_once(',') {
                 let src = src.trim();
