@@ -603,10 +603,13 @@ pub(super) fn fold_xmm_through_accumulator(store: &mut LineStore, infos: &mut [L
 
         let trimmed_j = infos[j].trimmed(store.get(j));
 
-        // Match `movq %rax, <dest>` where dest is a register or memory
+        // Match `movq %rax, <dest>` where dest is a register (NOT memory).
+        // We must NOT fold to memory destinations because it creates a
+        // cross-domain store forwarding stall: an XMM store to a stack slot
+        // followed by a GP load from the same slot incurs ~10-15 cycle penalty.
         if let Some(dest) = trimmed_j.strip_prefix("movq %rax, ") {
             let dest = dest.trim();
-            if dest == "%rax" {
+            if dest == "%rax" || dest.contains('(') {
                 i += 1;
                 continue;
             }
@@ -637,21 +640,116 @@ pub(super) fn fold_xmm_through_accumulator(store: &mut LineStore, infos: &mut [L
 /// from position `start`. Scans at most 16 instructions forward and gives up
 /// conservatively (returns false) at control flow boundaries.
 fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: usize, reg: u8) -> bool {
+    is_reg_dead_scan(infos, store, start, len, reg, 16, 0, None)
+}
+
+/// Extended liveness check that can look past conditional jumps, unconditional
+/// jumps, and fallthrough-only labels by following control flow. The `depth`
+/// parameter (default 2) limits recursion through branches/jumps.
+fn is_reg_dead_after_ext(
+    infos: &[LineInfo], store: &LineStore, start: usize, len: usize, reg: u8,
+    targets: &super::helpers::JumpTargets,
+) -> bool {
+    is_reg_dead_scan(infos, store, start, len, reg, 24, 2, Some(targets))
+}
+
+/// Core liveness scan with depth-limited cross-block analysis.
+/// `depth` controls how many control flow boundaries (CondJmp, Jmp, jump-target
+/// Labels) the scan can look past. depth=0 is the basic local-only scan.
+fn is_reg_dead_scan(
+    infos: &[LineInfo], store: &LineStore, start: usize, len: usize,
+    reg: u8, max_scan: usize, depth: usize,
+    targets: Option<&super::helpers::JumpTargets>,
+) -> bool {
     let reg_bit = 1u16 << reg;
     let mut scanned = 0;
     let mut k = start;
-    while k < len && scanned < 16 {
+    while k < len && scanned < max_scan {
         if infos[k].is_nop() {
             k += 1;
             continue;
         }
 
-        // Control flow boundary: label, jump, conditional jump — conservatively unsafe
+        // Control flow boundary handling
         match infos[k].kind {
-            LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp => return false,
-            // calls clobber rax (caller-saved), so if reg==rax it's dead after call
-            LineKind::Call => return reg == 0,
-            LineKind::Ret => return false,
+            LineKind::Label => {
+                if let Some(tgt) = targets {
+                    let label_text = infos[k].trimmed(store.get(k));
+                    let is_jump_target = if let Some(n) = super::helpers::parse_label_number(label_text) {
+                        (n as usize) < tgt.is_jump_target.len() && tgt.is_jump_target[n as usize]
+                    } else {
+                        tgt.has_non_numeric_jump_targets
+                    };
+                    if !is_jump_target {
+                        // Fallthrough-only label — safe to scan past
+                        k += 1;
+                        continue;
+                    }
+                    // Jump-target label: code here may be reached from multiple paths.
+                    // Check if register is dead starting from here (using a sub-scan).
+                    if depth > 0 {
+                        let dead_here = is_reg_dead_scan(
+                            infos, store, k + 1, len, reg, 16, depth - 1, targets
+                        );
+                        if dead_here {
+                            k += 1;
+                            continue;
+                        }
+                    }
+                }
+                return false;
+            }
+            LineKind::Jmp => {
+                if depth > 0 {
+                    // Follow the unconditional jump to its target.
+                    let trimmed = infos[k].trimmed(store.get(k));
+                    if let Some(target_label) = super::helpers::extract_jump_target(trimmed) {
+                        if let Some(tp) = find_label_pos(infos, store, len, target_label) {
+                            return is_reg_dead_scan(
+                                infos, store, tp, len, reg, 16, depth - 1, targets
+                            );
+                        }
+                    }
+                }
+                return false;
+            }
+            LineKind::JmpIndirect => return false,
+            LineKind::CondJmp => {
+                if depth == 0 {
+                    return false;
+                }
+                // Check both paths: fallthrough and jump target.
+                let trimmed = infos[k].trimmed(store.get(k));
+                let target = super::helpers::extract_jump_target(trimmed);
+
+                // Fallthrough path
+                let fall_dead = is_reg_dead_scan(
+                    infos, store, k + 1, len, reg, 16, depth - 1, targets
+                );
+                if !fall_dead {
+                    return false;
+                }
+
+                // Jump target path
+                if let Some(target_label) = target {
+                    if let Some(tp) = find_label_pos(infos, store, len, target_label) {
+                        return is_reg_dead_scan(
+                            infos, store, tp, len, reg, 16, depth - 1, targets
+                        );
+                    }
+                }
+                return false; // couldn't find target — conservative
+            }
+            // Calls clobber all caller-saved registers (rax, rcx, rdx, rsi, rdi, r8-r11).
+            // If the scan reached here without finding a read of `reg`, the register
+            // is dead — either the callee doesn't use it, or it was set up by an
+            // earlier instruction (which the scan would have caught as a reference).
+            // Callee-saved registers (rbx, r12-r15) survive across calls, so they
+            // are NOT dead at a call boundary. rsp/rbp are special — never dead.
+            LineKind::Call => {
+                return reg != 4 && reg != 5 && !super::helpers::is_callee_saved_reg(reg);
+            }
+            LineKind::Ret => return true,
             _ => {}
         }
 
@@ -670,6 +768,10 @@ fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: u
                     || trimmed.starts_with("leaq ") || trimmed.starts_with("leal ")
                     || trimmed.starts_with("movabs")
                     || trimmed.starts_with("xorl %eax, %eax")
+                    || trimmed.starts_with("movzbl ") || trimmed.starts_with("movzbq ")
+                    || trimmed.starts_with("movzwl ") || trimmed.starts_with("movzwq ")
+                    || trimmed.starts_with("movslq ") || trimmed.starts_with("movsbq ")
+                    || trimmed.starts_with("movsbl ")
                 {
                     // Pure overwrite — reg is dead here
                     return true;
@@ -693,6 +795,29 @@ fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: u
 
     // Reached scan limit without finding a definitive answer — conservatively unsafe
     false
+}
+
+/// Find the position of a label definition (the instruction after the label line).
+/// Returns the index of the first non-NOP instruction after the label.
+fn find_label_pos(infos: &[LineInfo], store: &LineStore, len: usize, target: &str) -> Option<usize> {
+    for idx in 0..len {
+        if infos[idx].kind == LineKind::Label {
+            let label_text = infos[idx].trimmed(store.get(idx));
+            // Label text includes colon, e.g. ".LBB3:"
+            if label_text.len() > 1
+                && label_text.ends_with(':')
+                && &label_text[..label_text.len() - 1] == target
+            {
+                // Return position after the label
+                let mut pos = idx + 1;
+                while pos < len && infos[pos].is_nop() {
+                    pos += 1;
+                }
+                return Some(pos);
+            }
+        }
+    }
+    None
 }
 
 // ── 64-bit → 32-bit operation narrowing ─────────────────────────────────────
@@ -988,6 +1113,9 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
     let len = store.len();
     const RCX: u8 = 1; // register family 1 = rcx/ecx/cx/cl
 
+    // Build jump target map to distinguish fallthrough-only labels from real targets.
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
     let mut i = 0;
     while i + 1 < len {
         if infos[i].is_nop() {
@@ -1043,8 +1171,10 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
             continue;
         }
 
-        // Check that %rcx is dead after the memory instruction
-        if !is_reg_dead_after(infos, store, j + 1, len, RCX) {
+        // Check that %rcx is dead after the memory instruction.
+        // Use extended liveness with jump target analysis to look past
+        // conditional jumps and fallthrough-only labels.
+        if !is_reg_dead_after_ext(infos, store, j + 1, len, RCX, &targets) {
             i += 1;
             continue;
         }
@@ -1055,6 +1185,220 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
         replace_line(store, &mut infos[j], j, new_text);
         changed = true;
         i = j + 1;
+    }
+    changed
+}
+
+// ── Accumulator routing fold ────────────────────────────────────────────────
+//
+// CCC routes most values through %rax (the accumulator), producing two-movq
+// chains where a single instruction suffices:
+//
+//   movq $1, %rax; movq %rax, %r10   → movq $1, %r10
+//   movq %rbx, %rax; movq %rax, %r11 → movq %rbx, %r11
+//
+// The pattern matches any `movq <src>, %rT; movq %rT, %rN` where:
+// - <src> is an immediate ($N) or register (%reg)
+// - %rT is dead after the second movq
+// - %rN is a different GP register from %rT
+//
+// This is a local two-instruction fold; the global copy propagation pass
+// handles wider chains but can't fold across control flow barriers.
+
+pub(super) fn fold_accumulator_routing(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Match: movq <src>, %rT (where src is $imm or %reg, not memory)
+        if let LineKind::Other { dest_reg: temp_reg } = infos[i].kind {
+            if !is_valid_gp_reg(temp_reg) || temp_reg == 4 || temp_reg == 5 {
+                i += 1;
+                continue;
+            }
+
+            let trimmed_i = infos[i].trimmed(store.get(i));
+            let rest = match trimmed_i.strip_prefix("movq ") {
+                Some(r) => r,
+                None => { i += 1; continue; }
+            };
+            let (src_str, dst_str) = match rest.split_once(", ") {
+                Some(pair) => pair,
+                None => { i += 1; continue; }
+            };
+
+            let temp_64 = REG_NAMES[0][temp_reg as usize];
+            if dst_str != temp_64 {
+                i += 1;
+                continue;
+            }
+
+            // Source must be $imm or %reg (not memory — no parentheses)
+            let is_imm = src_str.starts_with('$');
+            let is_reg = src_str.starts_with('%') && !src_str.contains('(');
+            if !is_imm && !is_reg {
+                i += 1;
+                continue;
+            }
+
+            // If source is a register, it must not be the same as temp
+            if is_reg {
+                let src_fam = register_family_fast(src_str);
+                if src_fam == temp_reg {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Find next non-NOP instruction
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            // Match: movq %rT, %rN
+            let trimmed_j = infos[j].trimmed(store.get(j));
+            let expected_prefix = format!("movq {}, ", temp_64);
+            if let Some(dest_str) = trimmed_j.strip_prefix(expected_prefix.as_str()) {
+                let dest_str = dest_str.trim();
+                if !dest_str.starts_with('%') || dest_str.contains('(') {
+                    i += 1;
+                    continue;
+                }
+                let dest_fam = register_family_fast(dest_str);
+                if !is_valid_gp_reg(dest_fam) || dest_fam == temp_reg
+                    || dest_fam == 4 || dest_fam == 5
+                {
+                    i += 1;
+                    continue;
+                }
+
+                // Check temp_reg dead after j (extended: cross-block)
+                if is_reg_dead_after_ext(infos, store, j + 1, len, temp_reg, &targets) {
+                    // Fold: NOP instruction i, rewrite j as movq <src>, <dest>
+                    let new_text = format!("    movq {}, {}", src_str, dest_str);
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, new_text);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+// ── Increment-in-place fold ─────────────────────────────────────────────────
+//
+// CCC's codegen produces three-instruction sequences to modify a value in a
+// register, routing through a temporary:
+//
+//   movq %r15, %rsi; addq $1, %rsi; movq %rsi, %r15  → addq $1, %r15
+//   movq %rbx, %rsi; subq $1, %rsi; movq %rsi, %rbx  → subq $1, %rbx
+//
+// This fold replaces the 3-instruction pattern with 1, eliminating 2 instructions.
+// Safety: the temporary register (%rsi in the examples) must be dead after the
+// third instruction.
+
+/// Match `addq/subq $imm, %rT` and return the prefix and immediate string.
+fn match_arith_imm_reg<'a>(trimmed: &'a str, reg_64: &str) -> Option<(&'a str, &'a str)> {
+    for prefix in &["addq $", "subq $"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some((imm, dst)) = rest.split_once(", ") {
+                if dst.trim() == reg_64 {
+                    return Some((prefix, imm));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn fold_increment_in_place(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 2 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Match: movq %rN, %rT (reg-to-reg copy)
+        let trimmed_i = infos[i].trimmed(store.get(i));
+        let (src_fam, tmp_fam) = match super::helpers::parse_reg_to_reg_movq(&infos[i], trimmed_i) {
+            Some(pair) => pair,
+            None => { i += 1; continue; }
+        };
+
+        let src_64 = REG_NAMES[0][src_fam as usize];
+        let tmp_64 = REG_NAMES[0][tmp_fam as usize];
+
+        // Find next non-NOP: should be addq/subq $imm, %rT
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_j = infos[j].trimmed(store.get(j));
+
+        // Match addq/subq $imm, %rT
+        let op_match = match_arith_imm_reg(trimmed_j, tmp_64);
+        let (op_prefix, imm_str) = match op_match {
+            Some(pair) => pair,
+            None => { i += 1; continue; }
+        };
+
+        // Find next non-NOP: should be movq %rT, %rN
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() {
+            k += 1;
+        }
+        if k >= len {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_k = infos[k].trimmed(store.get(k));
+        let expected = format!("movq {}, {}", tmp_64, src_64);
+        if trimmed_k != expected {
+            i += 1;
+            continue;
+        }
+
+        // Check tmp_reg dead after k (extended: cross-block)
+        if !is_reg_dead_after_ext(infos, store, k + 1, len, tmp_fam, &targets) {
+            i += 1;
+            continue;
+        }
+
+        // Fold: NOP first two, rewrite third as op $imm, %rN
+        let new_text = format!("    {}{}, {}", op_prefix, imm_str, src_64);
+        mark_nop(&mut infos[i]);
+        mark_nop(&mut infos[j]);
+        replace_line(store, &mut infos[k], k, new_text);
+        changed = true;
+        i = k + 1;
     }
     changed
 }
