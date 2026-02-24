@@ -62,7 +62,7 @@ pub struct MacroDef {
     /// Whether this is a function-like macro
     pub is_function_like: bool,
     /// Parameters for function-like macros
-    pub params: Vec<String>,
+    pub params: Vec<Rc<str>>,
     /// Whether the macro is variadic (last param is ...)
     pub is_variadic: bool,
     /// Whether the variadic is a named parameter (e.g., `args...` vs `...`).
@@ -70,7 +70,7 @@ pub struct MacroDef {
     /// When false, variadic args are accessed via `__VA_ARGS__`.
     pub has_named_variadic: bool,
     /// The replacement body (as raw text)
-    pub body: String,
+    pub body: Rc<str>,
 }
 
 /// Marker byte used to "blue paint" tokens that were suppressed due to
@@ -185,6 +185,7 @@ impl MacroTable {
     /// Otherwise, a new entry is created.
     /// This avoids 2 full MacroDef allocations per #include directive.
     pub fn set_file(&mut self, body: String) {
+        let body: Rc<str> = Rc::from(body);
         if let Some(existing) = self.macros.get_mut("__FILE__") {
             existing.body = body;
         } else {
@@ -202,7 +203,7 @@ impl MacroTable {
     /// Get the current __FILE__ macro body.
     /// Returns None if __FILE__ is not defined.
     pub fn get_file_body(&self) -> Option<&str> {
-        self.macros.get("__FILE__").map(|m| m.body.as_str())
+        self.macros.get("__FILE__").map(|m| &*m.body)
     }
 
     /// Enable or disable macro expansion tracking.
@@ -824,7 +825,7 @@ impl MacroTable {
     fn handle_stringify_and_paste<'a>(
         &self,
         body: &'a str,
-        params: &[String],
+        params: &[Rc<str>],
         args: &[String],
         is_variadic: bool,
         has_named_variadic: bool,
@@ -868,7 +869,7 @@ impl MacroTable {
                             result.push_str(&va_args);
                             result.push(PASTE_PROTECT_END as char);
                         }
-                    } else if let Some(idx) = params.iter().position(|p| p == left_ident.as_str()) {
+                    } else if let Some(idx) = params.iter().position(|p| &**p == left_ident.as_str()) {
                         let trim_len = result.len() - left_ident.len();
                         result.truncate(trim_len);
                         let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
@@ -911,7 +912,7 @@ impl MacroTable {
                             result.push_str(&va_args);
                             result.push(PASTE_PROTECT_END as char);
                         }
-                    } else if let Some(idx) = params.iter().position(|p| p == right_ident) {
+                    } else if let Some(idx) = params.iter().position(|p| &**p == right_ident) {
                         let is_named_variadic_param = is_variadic && has_named_variadic && idx == params.len() - 1;
                         if is_named_variadic_param {
                             let va_args_raw = self.get_named_va_args(idx, args);
@@ -979,7 +980,7 @@ impl MacroTable {
                         result.push('"');
                         result.push_str(&stringify_arg(&va_args));
                         result.push('"');
-                    } else if let Some(idx) = params.iter().position(|p| p == param_name) {
+                    } else if let Some(idx) = params.iter().position(|p| &**p == param_name) {
                         let arg_str = if is_variadic && has_named_variadic && idx == params.len() - 1 {
                             self.get_named_va_args(idx, args)
                         } else {
@@ -1020,7 +1021,7 @@ impl MacroTable {
     fn substitute_params(
         &self,
         body: &str,
-        params: &[String],
+        params: &[Rc<str>],
         args: &[String],
         is_variadic: bool,
         has_named_variadic: bool,
@@ -1075,7 +1076,7 @@ impl MacroTable {
                     let va_args = self.get_va_args(params, args);
                     let next = if i < len { Some(bytes[i]) } else { None };
                     Self::append_with_paste_guard(&mut result, &va_args, next);
-                } else if let Some(idx) = params.iter().position(|p| p == ident) {
+                } else if let Some(idx) = params.iter().position(|p| &**p == ident) {
                     if is_variadic && has_named_variadic && idx == params.len() - 1 {
                         let va_args = self.get_named_va_args(idx, args);
                         let next = if i < len { Some(bytes[i]) } else { None };
@@ -1119,7 +1120,7 @@ impl MacroTable {
     }
 
     /// Get variadic arguments (__VA_ARGS__) as a comma-separated string.
-    fn get_va_args(&self, params: &[String], args: &[String]) -> String {
+    fn get_va_args(&self, params: &[Rc<str>], args: &[String]) -> String {
         let named_count = params.len();
         if args.len() > named_count {
             args[named_count..].join(", ")
@@ -1388,7 +1389,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
                 while i < len && is_ident_cont_byte(bytes[i]) {
                     i += 1;
                 }
-                let param = bytes_to_str(bytes, start, i).to_string();
+                let param: Rc<str> = Rc::from(bytes_to_str(bytes, start, i));
 
                 if i + 2 < len && bytes[i] == b'.' && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
                     is_variadic = true;
@@ -1417,10 +1418,10 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
         }
 
         // Rest is the body
-        let body = if i < len {
-            line[i..].trim().to_string()
+        let body: Rc<str> = if i < len {
+            Rc::from(line[i..].trim())
         } else {
-            String::new()
+            Rc::from("")
         };
 
         Some(MacroDef {
@@ -1433,10 +1434,10 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
         })
     } else {
         // Object-like macro
-        let body = if i < len {
-            line[i..].trim().to_string()
+        let body: Rc<str> = if i < len {
+            Rc::from(line[i..].trim())
         } else {
-            String::new()
+            Rc::from("")
         };
 
         Some(MacroDef {

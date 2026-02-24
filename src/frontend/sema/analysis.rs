@@ -137,7 +137,7 @@ pub struct SemanticAnalyzer {
     /// `struct X;` (forward declaration, incomplete) for the incomplete type
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
-    defined_structs: RefCell<FxHashSet<String>>,
+    defined_structs: RefCell<FxHashSet<Rc<str>>>,
 }
 
 impl SemanticAnalyzer {
@@ -1929,7 +1929,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         // forward-declared (`struct X;`). This distinction is needed for the
         // incomplete type check in analyze_declaration.
         if fields.is_some() {
-            self.defined_structs.borrow_mut().insert(key.clone());
+            self.defined_structs.borrow_mut().insert(Rc::from(key.as_str()));
         }
         if !struct_fields.is_empty() {
             let mut layout = if is_union {

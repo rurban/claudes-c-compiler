@@ -204,10 +204,10 @@ impl Preprocessor {
             self.macros.define(MacroDef {
                 name: Rc::from(name),
                 is_function_like: true,
-                params: params.iter().map(|s| s.to_string()).collect(),
+                params: params.iter().map(|&s| Rc::from(s)).collect(),
                 is_variadic: false,
                 has_named_variadic: false,
-                body: body.to_string(),
+                body: Rc::from(body),
             });
         }
     }
@@ -220,7 +220,7 @@ impl Preprocessor {
             params: Vec::new(),
             is_variadic: false,
             has_named_variadic: false,
-            body: body.to_string(),
+            body: Rc::from(body),
         });
     }
 

@@ -80,16 +80,16 @@ pub struct Preprocessor {
     pub(super) pending_injections: Vec<String>,
     /// Stack for #pragma push_macro / pop_macro.
     /// Maps macro name -> stack of saved definitions (None = was undefined).
-    pub(super) macro_save_stack: FxHashMap<String, Vec<Option<MacroDef>>>,
+    pub(super) macro_save_stack: FxHashMap<Rc<str>, Vec<Option<MacroDef>>>,
     /// Line offset set by #line directive: effective_line = line_offset + (source_line - line_offset_base)
     /// When None, no #line has been issued and __LINE__ uses the source line directly.
     line_override: Option<(usize, usize)>, // (target_line, source_line_at_directive)
     /// #pragma weak directives: (symbol, optional_alias_target)
     /// - (symbol, None) means "mark symbol as weak"
     /// - (symbol, Some(target)) means "symbol is a weak alias for target"
-    pub weak_pragmas: Vec<(String, Option<String>)>,
+    pub weak_pragmas: Vec<(Rc<str>, Option<Rc<str>>)>,
     /// #pragma redefine_extname directives: (old_name, new_name)
-    pub redefine_extname_pragmas: Vec<(String, String)>,
+    pub redefine_extname_pragmas: Vec<(Rc<str>, Rc<str>)>,
     /// Accumulated output from force-included files (-include).
     /// Prepended to the main source's preprocessed output so that pragma
     /// synthetic tokens (e.g., visibility push/pop) take effect.
@@ -112,7 +112,7 @@ pub struct Preprocessor {
     ///
     /// On subsequent #include of the same file, if the guard macro is still defined,
     /// we skip re-processing entirely (same optimization as GCC/Clang).
-    pub(super) include_guard_macros: FxHashMap<PathBuf, String>,
+    pub(super) include_guard_macros: FxHashMap<PathBuf, Rc<str>>,
     /// Reusable FxHashSet for directive-level macro expansion (handle_if, handle_elif,
     /// handle_line_directive, #error). Avoids allocating a new FxHashSet per directive.
     directive_expanding: FxHashSet<Rc<str>>,
@@ -623,7 +623,7 @@ impl Preprocessor {
             params: Vec::new(),
             is_variadic: false,
             has_named_variadic: false,
-            body: format!("\"{}\"", filename),
+            body: Rc::from(format!("\"{}\"", filename).as_str()),
         });
         // Push the file path onto the include stack for relative includes.
         // Use make_absolute (not canonicalize) to preserve symlinks, matching GCC
@@ -694,7 +694,7 @@ impl Preprocessor {
             params: Vec::new(),
             is_variadic: false,
             has_named_variadic: false,
-            body: value.to_string(),
+            body: Rc::from(value),
         });
     }
 

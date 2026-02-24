@@ -1030,10 +1030,10 @@ impl Driver {
         for (symbol, target) in &preprocessor.weak_pragmas {
             if let Some(ref alias_target) = target {
                 // #pragma weak symbol = alias -> create weak alias
-                module.aliases.push((std::rc::Rc::from(symbol.as_str()), std::rc::Rc::from(alias_target.as_str()), true));
+                module.aliases.push((std::rc::Rc::clone(symbol), std::rc::Rc::clone(alias_target), true));
             } else {
                 // #pragma weak symbol -> mark as weak
-                module.symbol_attrs.push((std::rc::Rc::from(symbol.as_str()), true, None));
+                module.symbol_attrs.push((std::rc::Rc::clone(symbol), true, None));
             }
         }
 
@@ -1042,7 +1042,7 @@ impl Driver {
         // locally, but a proper implementation would rename symbol references
         // during lowering/codegen for the case where new_name is external.
         for (old_name, new_name) in &preprocessor.redefine_extname_pragmas {
-            module.aliases.push((std::rc::Rc::from(old_name.as_str()), std::rc::Rc::from(new_name.as_str()), false));
+            module.aliases.push((std::rc::Rc::clone(old_name), std::rc::Rc::clone(new_name), false));
         }
 
         // Apply -fcommon: mark tentative definitions as COMMON symbols.
