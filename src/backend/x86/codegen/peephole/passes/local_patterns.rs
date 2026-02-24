@@ -740,16 +740,12 @@ fn is_reg_dead_scan(
                 }
                 return false; // couldn't find target — conservative
             }
-            // Calls clobber all caller-saved registers (rax, rcx, rdx, rsi, rdi, r8-r11).
-            // If the scan reached here without finding a read of `reg`, the register
-            // is dead — either the callee doesn't use it, or it was set up by an
-            // earlier instruction (which the scan would have caught as a reference).
-            // Callee-saved registers (rbx, r12-r15) survive across calls, so they
-            // are NOT dead at a call boundary. rsp/rbp are special — never dead.
             LineKind::Call => {
                 return reg != 4 && reg != 5 && !super::helpers::is_callee_saved_reg(reg);
             }
-            LineKind::Ret => return true,
+            // At ret, %rax (reg=0) is live — it holds the function return value.
+            // All other GP registers are dead at the function return.
+            LineKind::Ret => return reg != 0,
             _ => {}
         }
 
@@ -765,7 +761,6 @@ fn is_reg_dead_scan(
                 let trimmed = infos[k].trimmed(store.get(k));
                 if trimmed.starts_with("movq ") || trimmed.starts_with("movl ")
                     || trimmed.starts_with("movb ") || trimmed.starts_with("movw ")
-                    || trimmed.starts_with("leaq ") || trimmed.starts_with("leal ")
                     || trimmed.starts_with("movabs")
                     || trimmed.starts_with("xorl %eax, %eax")
                     || trimmed.starts_with("movzbl ") || trimmed.starts_with("movzbq ")
@@ -775,6 +770,27 @@ fn is_reg_dead_scan(
                 {
                     // Pure overwrite — reg is dead here
                     return true;
+                }
+                // leaq/leal: pure overwrite ONLY if dest reg doesn't appear in src operand.
+                // e.g. `leaq A(%rip), %rax` is pure overwrite (rax not in src),
+                // but  `leaq 8(%rax), %rax` is read-modify-write (rax IS in src).
+                if trimmed.starts_with("leaq ") || trimmed.starts_with("leal ") {
+                    if let Some(comma_pos) = trimmed.rfind(", ") {
+                        let src_part = &trimmed[..comma_pos];
+                        // Check if any name variant of the dest register appears in src
+                        let mut reg_in_src = false;
+                        for size_idx in 0..4 {
+                            let name = REG_NAMES[size_idx][reg as usize];
+                            if src_part.contains(name) {
+                                reg_in_src = true;
+                                break;
+                            }
+                        }
+                        if !reg_in_src {
+                            return true; // Pure overwrite
+                        }
+                    }
+                    // dest reg appears in src → read-modify-write, fall through to return false
                 }
             }
             // Referenced but not a pure overwrite → reg is read, fold unsafe
@@ -1402,3 +1418,4 @@ pub(super) fn fold_increment_in_place(store: &mut LineStore, infos: &mut [LineIn
     }
     changed
 }
+
