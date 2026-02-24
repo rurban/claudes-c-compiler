@@ -384,6 +384,9 @@ impl X86Codegen {
                         } else {
                             self.state.out.emit_instr_rbp_reg("    leaq", slot.0, target_name);
                         }
+                    } else if self.state.small_slot_values.contains(&v.0) {
+                        let target_32 = phys_reg_name_32(target);
+                        self.state.out.emit_instr_rbp_reg("    movl", slot.0, target_32);
                     } else {
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, target_name);
                     }
@@ -491,7 +494,12 @@ impl X86Codegen {
             self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store to stack slot.
-            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            // Use movl for 4-byte small slots (I8-I32, U8-U32, F32).
+            if self.state.small_slot_values.contains(&dest.0) {
+                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+            } else {
+                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            }
         }
         // After storing to dest, %rax still holds dest's value
         self.state.reg_cache.set_acc(dest.0, false);
@@ -678,6 +686,10 @@ impl X86Codegen {
                 } else {
                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
                 }
+            } else if self.state.small_slot_values.contains(&val.0) {
+                // 4-byte slot: use movl which zero-extends to 64 bits.
+                let reg32 = reg_name_to_32(reg);
+                self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }
