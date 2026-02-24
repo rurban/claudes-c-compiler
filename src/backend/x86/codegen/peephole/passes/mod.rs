@@ -69,6 +69,7 @@ pub fn peephole_optimize(asm: String) -> String {
         let local_changed = local_patterns::combined_local_pass(&mut store, &mut infos);
         changed |= local_changed;
         changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+        changed |= local_patterns::narrow_64_to_32(&mut store, &mut infos);
         changed |= local_patterns::fold_xmm_through_accumulator(&mut store, &mut infos);
         changed |= local_patterns::fold_address_through_secondary(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
@@ -98,6 +99,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos);
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed2 |= local_patterns::narrow_64_to_32(&mut store, &mut infos);
             changed2 |= local_patterns::fold_xmm_through_accumulator(&mut store, &mut infos);
             changed2 |= local_patterns::fold_address_through_secondary(&mut store, &mut infos);
             changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
@@ -118,6 +120,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 = false;
             changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed3 |= local_patterns::narrow_64_to_32(&mut store, &mut infos);
             changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);

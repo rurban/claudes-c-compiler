@@ -695,6 +695,275 @@ fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: u
     false
 }
 
+// ── 64-bit → 32-bit operation narrowing ─────────────────────────────────────
+//
+// Narrows 64-bit operations to 32-bit equivalents when the upper 32 bits are
+// provably zero. On x86-64, 32-bit register operations implicitly zero-extend
+// the upper 32 bits of the 64-bit register, so narrowing is always safe when:
+//
+//   1. `andq $imm, %reg` where 0 <= imm <= 0x7FFFFFFF → `andl $imm, %regd`
+//      The AND result fits in 32 bits since the immediate limits the output range.
+//
+//   2. `testq %reg, %reg` after a 32-bit operation → `testl %regd, %regd`
+//      The value is already zero-extended, so 64-bit test is equivalent to 32-bit.
+//
+//   3. `movslq %regd, %rax` after a 32-bit operation that zero-extends →
+//      eliminate entirely. The 32-bit op already zero-extended bit 31=0, so
+//      movslq (sign-extend from 32 to 64) is a no-op.
+//
+// These patterns arise from CCC's accumulator-based codegen which emits 64-bit
+// instructions even when 32-bit would suffice (the C type system doesn't propagate
+// down to instruction selection). The strprocess benchmark's count_words hot loop
+// has exactly this pattern: `andq $8192, %rdi; movslq %edi, %rax; testq %rax, %rax`.
+
+pub(super) fn narrow_64_to_32(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // --- Pattern 1: andq $imm, %reg → andl $imm, %regd ---
+        // Safe when: immediate is non-negative and fits in 32 bits (0..=0x7FFFFFFF).
+        // After andl, the result is zero-extended to 64 bits automatically.
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if is_valid_gp_reg(dest_reg) {
+                let trimmed = infos[i].trimmed(store.get(i));
+                if let Some(rest) = trimmed.strip_prefix("andq $") {
+                    if let Some((imm_str, reg_str)) = rest.split_once(',') {
+                        let imm_str = imm_str.trim();
+                        let reg_str = reg_str.trim();
+                        // Parse the immediate value
+                        if let Ok(imm) = imm_str.parse::<i64>() {
+                            // Safe to narrow if immediate is in range [0, 0x7FFFFFFF].
+                            // Negative immediates or values > 2^31-1 need 64-bit AND.
+                            if imm >= 0 && imm <= 0x7FFFFFFF {
+                                let reg_fam = register_family_fast(reg_str);
+                                if is_valid_gp_reg(reg_fam) {
+                                    let reg32 = REG_NAMES[1][reg_fam as usize];
+                                    let new_line = format!("    andl ${}, {}", imm, reg32);
+                                    replace_line(store, &mut infos[i], i, new_line);
+                                    changed = true;
+                                    // After andl, the dest register is known to be zero-extended.
+                                    // Check the next instruction for further narrowing opportunities.
+                                    narrow_after_32bit_op(store, infos, i, len, dest_reg, &mut changed);
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Pattern 2: movslq %regd, %reg → eliminate/narrow ---
+        // Self-extension (movslq %eax, %rax): eliminate when source is known 32-bit.
+        // Cross-register (movslq %edi, %rax): narrow to movl %edi, %eax.
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if is_valid_gp_reg(dest_reg) {
+                let trimmed = infos[i].trimmed(store.get(i));
+                if let Some(rest) = trimmed.strip_prefix("movslq ") {
+                    if let Some((src, dst)) = rest.split_once(',') {
+                        let src = src.trim();
+                        let dst = dst.trim();
+                        let src_fam = register_family_fast(src);
+                        let dst_fam = register_family_fast(dst);
+                        if is_valid_gp_reg(src_fam) && is_valid_gp_reg(dst_fam)
+                            && is_known_32bit_value(infos, store, i, src_fam)
+                        {
+                            if src_fam == dst_fam {
+                                // Self-extension: eliminate entirely
+                                mark_nop(&mut infos[i]);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            } else {
+                                // Cross-register: narrow to movl
+                                let src_32 = REG_NAMES[1][src_fam as usize];
+                                let dst_32 = REG_NAMES[1][dst_fam as usize];
+                                let new_line = format!("    movl {}, {}", src_32, dst_32);
+                                replace_line(store, &mut infos[i], i, new_line);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Pattern 3: testq %reg, %reg → testl %regd, %regd ---
+        // testq is classified as LineKind::Cmp, so we check separately.
+        // Safe when the value in %reg is known to be zero-extended (i.e.,
+        // produced by a 32-bit operation). Look backward for a producer.
+        if infos[i].kind == LineKind::Cmp {
+            let trimmed = infos[i].trimmed(store.get(i));
+            if let Some(rest) = trimmed.strip_prefix("testq ") {
+                if let Some((src, dst)) = rest.split_once(',') {
+                    let src = src.trim();
+                    let dst = dst.trim();
+                    // Only handle testq %reg, %reg (same register)
+                    if src == dst && src.starts_with('%') {
+                        let reg_fam = register_family_fast(src);
+                        if is_valid_gp_reg(reg_fam) {
+                            // Scan backward to find if the value is 32-bit
+                            if is_known_32bit_value(infos, store, i, reg_fam) {
+                                let reg32 = REG_NAMES[1][reg_fam as usize];
+                                let new_line = format!("    testl {}, {}", reg32, reg32);
+                                replace_line(store, &mut infos[i], i, new_line);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// After rewriting a 64-bit op to 32-bit (e.g., andq→andl), check if the next
+/// instruction is a movslq or testq that can be narrowed/eliminated.
+fn narrow_after_32bit_op(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    producer_idx: usize,
+    len: usize,
+    producer_reg: u8,
+    changed: &mut bool,
+) {
+    // Find next non-NOP instruction
+    let mut j = producer_idx + 1;
+    while j < len && infos[j].is_nop() {
+        j += 1;
+    }
+    if j >= len {
+        return;
+    }
+
+    let trimmed_j = infos[j].trimmed(store.get(j));
+
+    if trimmed_j.starts_with("movslq ") {
+        if let Some(rest) = trimmed_j.strip_prefix("movslq ") {
+            if let Some((src, dst)) = rest.split_once(',') {
+                let src = src.trim();
+                let dst = dst.trim();
+                let src_fam = register_family_fast(src);
+                let dst_fam = register_family_fast(dst);
+                if src_fam == producer_reg {
+                    if src_fam == dst_fam {
+                        // Self-extension (e.g., movslq %eax, %rax) after a 32-bit op.
+                        // Since the 32-bit op zero-extends (bit 31 = 0 for positive
+                        // results like AND with a positive mask), movslq is a no-op.
+                        mark_nop(&mut infos[j]);
+                        *changed = true;
+                    } else if is_valid_gp_reg(dst_fam) {
+                        // Cross-register movslq (e.g., movslq %edi, %rax).
+                        // Since the source is known to be zero-extended (from the 32-bit
+                        // op), sign-extend = zero-extend, so movslq is equivalent to
+                        // movl (which is a shorter encoding and also zero-extends).
+                        let src_32 = REG_NAMES[1][src_fam as usize];
+                        let dst_32 = REG_NAMES[1][dst_fam as usize];
+                        let new_line = format!("    movl {}, {}", src_32, dst_32);
+                        replace_line(store, &mut infos[j], j, new_line);
+                        *changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Check if a register's value at position `pos` is known to be 32-bit
+/// (upper 32 bits are zero). Scans backward looking for a 32-bit producer.
+fn is_known_32bit_value(infos: &[LineInfo], store: &LineStore, pos: usize, reg: u8) -> bool {
+    if pos == 0 {
+        return false;
+    }
+    let reg_bit = 1u16 << reg;
+    let mut scanned = 0;
+    let mut k = pos - 1;
+    loop {
+        if scanned >= 12 {
+            return false;
+        }
+        if infos[k].is_nop() {
+            if k == 0 { return false; }
+            k -= 1;
+            continue;
+        }
+
+        // Stop at control flow boundaries
+        if infos[k].is_barrier() {
+            return false;
+        }
+
+        // Skip stores — they don't modify registers
+        if matches!(infos[k].kind, LineKind::StoreRbp { .. }) {
+            if k == 0 { return false; }
+            k -= 1;
+            scanned += 1;
+            continue;
+        }
+
+        // Check if this instruction writes to our register
+        let dest = super::helpers::get_dest_reg(&infos[k]);
+        if dest == reg {
+            let trimmed = infos[k].trimmed(store.get(k));
+            // 32-bit arithmetic operations: andl, addl, subl, orl, xorl, etc.
+            // These all zero-extend the result to 64 bits.
+            if trimmed.starts_with("andl ") || trimmed.starts_with("addl ")
+                || trimmed.starts_with("subl ") || trimmed.starts_with("orl ")
+                || trimmed.starts_with("xorl ") || trimmed.starts_with("shll ")
+                || trimmed.starts_with("shrl ") || trimmed.starts_with("sarl ")
+                || trimmed.starts_with("imull ")
+            {
+                return true;
+            }
+            // 32-bit moves: movl, movzbl, movzwl
+            if trimmed.starts_with("movl ") || trimmed.starts_with("movzbl ")
+                || trimmed.starts_with("movzwl ")
+            {
+                return true;
+            }
+            // movslq to this register also produces a 64-bit value but the upper
+            // bits may be set — so it's NOT a 32-bit producer in general.
+            // However, if the source is positive (e.g., after andl with positive mask),
+            // it would be. We conservatively say no.
+            return false;
+        }
+
+        // Check if this instruction modifies a different register (skip past it)
+        if infos[k].reg_refs & reg_bit != 0 {
+            // References our register but doesn't write it — it reads it.
+            // We can't determine the value from here; give up.
+            // Actually: if the instruction reads our reg but writes a different reg,
+            // we can skip past it. Only stop if it modifies our reg.
+            // The `dest != reg` check above already handled the write case.
+            // But implicit writes (div, cltq) could also modify our reg:
+            if reg == 0 {
+                if super::helpers::has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+                    return false;
+                }
+            }
+        }
+
+        scanned += 1;
+        if k == 0 { return false; }
+        k -= 1;
+    }
+}
+
 // ── Address-through-secondary register folding ──────────────────────────────
 //
 // Folds `movq %rN, %rcx; <mem-op> (%rcx), ...` into `<mem-op> (%rN), ...`
