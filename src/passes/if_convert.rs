@@ -378,10 +378,10 @@ fn detect_diamond(
     }
 
     // Limit the number of Select instructions per diamond.
-    // Each Select becomes a cmov chain (~5 x86 instructions: 2 movs, test, cmov, store).
-    // With more than 2 selects, the branchless version often exceeds the cost of
-    // a well-predicted branch diamond.
-    const MAX_SELECTS: usize = 2;
+    // Each Select becomes a cmov chain (~6 x86 instructions: load false_val, load true_val,
+    // load cond, test, cmov, store). Even 2 selects = 12+ instructions vs a branch diamond
+    // of ~4-6 instructions with good prediction, so only convert 1-select cases.
+    const MAX_SELECTS: usize = 1;
     if phi_selects.len() > MAX_SELECTS {
         return None;
     }
@@ -570,7 +570,7 @@ fn detect_triangle(
     }
 
     // Limit the number of Select instructions per triangle (same as diamond).
-    const MAX_SELECTS: usize = 2;
+    const MAX_SELECTS: usize = 1;
     if phi_selects.len() > MAX_SELECTS {
         return None;
     }

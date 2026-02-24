@@ -719,7 +719,7 @@ where branchless code is slower than well-predicted branches:
 
 | Limit | Value | Rationale |
 |---|---|---|
-| MAX_SELECTS | 2 | Each Select becomes a cmov chain (~5 x86 instructions). 3+ selects produce 15+ instructions, almost always worse than branches. |
+| MAX_SELECTS | 1 | Each Select becomes a cmov chain (~6 x86 instructions). 2+ selects produce 12+ instructions, worse than a branch diamond of ~4-6 instructions with good prediction. |
 | MAX_TOTAL_COST | 12 | Hoisted arm instructions + selects×5. Limits total speculated work even when select count is within bounds. |
 
 These limits directly target the pathological case of nested if/else-if chains
@@ -727,8 +727,8 @@ These limits directly target the pathological case of nested if/else-if chains
 the fixpoint loop previously converted multiple diamonds iteratively, producing
 4+ cmov chains in a single block. With the cost model, such patterns keep their
 branches, allowing the CPU's branch predictor to skip untaken paths entirely.
-Simple ternary expressions (1 select) and if/else with one variable update (2
-selects) are still converted.
+Simple ternary expressions (1 select) are still converted, while multi-select
+diamonds keep their branches for the branch predictor.
 
 ### ipcp -- Interprocedural Constant Propagation
 

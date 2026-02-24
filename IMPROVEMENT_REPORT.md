@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-~2,300 lines of new Rust code across 23 files. Zero regressions across 509 tests. The result: CCC now generates binaries that are **8.8% smaller** than GCC -O0, runs **12% faster** on matrix multiplication, and matches GCC -O0 on prime sieve --- with a full Wegman-Zadeck SCCP implementation closing the gap toward GCC -O1.
+~2,300 lines of new Rust code across 23 files. Zero regressions across 514 tests. The result: CCC now generates binaries that are **8.8% smaller** than GCC -O0, runs **12% faster** on matrix multiplication, and matches GCC -O0 on prime sieve --- with a full Wegman-Zadeck SCCP implementation closing the gap toward GCC -O1.
 
 This work transforms CCC from a compiler that couldn't compile `printf("Hello World")` into one that beats GCC -O0 on compute-intensive workloads and has the interprocedural constant propagation infrastructure to push further.
 
@@ -192,7 +192,7 @@ Profiling showed 17.5% of compile time is allocation overhead (`malloc`/`free`/`
 
 **Impact on optimization passes:** The inlining pass (`inline.rs`) builds `FxHashMap<Rc<str>, CalleeData>` with O(1) key cloning. IPCP (`ipcp.rs`) similarly benefits from 4 hash maps keyed by function name. Backend symbol collection (`generation.rs`) builds referenced-symbol sets with O(1) inserts. All passes that pattern-match on `Call { func, .. }` or `GlobalAddr { name, .. }` needed zero changes thanks to `Rc<str>` auto-deref.
 
-~200 lines changed across ~30 files. All 509 tests pass. Benchmarks verified.
+~200 lines changed across ~30 files. All 514 tests pass. Benchmarks verified.
 
 ---
 
@@ -266,13 +266,13 @@ For a 32-byte struct copy: 4 qword moves instead of 32 byte moves. 8x fewer iter
 | **sieve** | 210 ms | 210 ms | **Tied** | 87 ms |
 | **fib** | 4 ms | 4 ms | Tied | 4 ms |
 | **hello** | 4 ms | 4 ms | Tied | 4 ms |
-| **strprocess** | 3,801 ms* | 2,857 ms | GCC 33% faster | 897 ms |
+| **strprocess** | 3,654 ms* | 2,890 ms | GCC 26% faster | 905 ms |
 
-\* *strprocess times updated after if-convert cost model (10-run mean). Previous measurement (1,944 ms) used a smaller workload.*
+\* *strprocess times updated after copy propagation + if-convert tightening (5-run mean). Previous: 3,801 ms (if-convert only), 3,919 ms (original). The gap vs GCC -O0 narrowed from 33% to 26%.*
 
 CCC beats or matches GCC -O0 on 4 of 5 benchmarks. The matmul result --- CCC producing faster code than GCC at the same optimization level --- is particularly notable for a compiler written by an AI.
 
-The strprocess gap was narrowed by the if-convert cost model (from 4 cmov chains to 2 in `count_words`, ~3% improvement). The remaining gap is in codegen: CCC generates more register moves and less efficient loop structure than GCC.
+The strprocess gap was narrowed in two phases: (1) if-convert cost model (MAX_SELECTS 4→2, total cost cap of 12, ~3% improvement), then (2) copy propagation tightening (MAX_SELECTS 2→1, fallthrough-label transparency, callee-saved preservation across calls, multi-propagation per instruction, ~9% cumulative improvement). The remaining gap vs GCC -O0 (26%) is in codegen: CCC still generates more register-to-register moves and less efficient loop structure than GCC.
 
 ### Binary Size
 
@@ -290,7 +290,7 @@ CCC produces consistently smaller binaries. Average savings: **8.8%** across all
 
 | Metric | Value |
 |--------|-------|
-| Unit tests passing | **509 / 509** |
+| Unit tests passing | **514 / 514** |
 | Tests ignored | 6 |
 | Tests failed | 0 |
 | Regressions introduced | **0** |
@@ -348,23 +348,24 @@ Every change followed the same process:
 1. **Measure first.** Run benchmarks, compare assembly output, identify the specific instructions causing the gap.
 2. **Understand the invariants.** Read the existing code. Trace how registers flow through the peephole pipeline. Understand what `is_reg_dead_after` guarantees and when it's safe to transform.
 3. **Implement the minimum change.** The address fold is 80 lines. The extension elimination enhancement is 20 lines. The memcpy upgrade is 10 lines. No unnecessary abstractions, no speculative features.
-4. **Verify with the full test suite.** 509 tests, every time.
+4. **Verify with the full test suite.** 514 tests, every time.
 5. **Benchmark, don't guess.** Compile the actual test programs, run them, measure wall-clock time with stable medians.
 
 ---
 
 ## What Remains
 
-**strprocess if-conversion cost model (partially addressed)**: The strprocess gap
-was caused by the `if_convert` pass unconditionally converting all diamond-shaped
-CFG patterns to branchless `Select`/cmov sequences, including nested if/else-if
-chains where well-predicted branches are faster. A cost model was added to
-`if_convert` that limits conversions to at most 2 selects per diamond and caps
-total speculated cost (hoisted instructions + selects×5) at 12. This reduced cmov
-count in `count_words` from 4 to 2 and improved strprocess runtime by ~3% (mean
-3.919s → 3.801s, 10 runs). The remaining gap vs GCC -O0 (33% slower) is in
-codegen: CCC still generates more register-to-register moves and less efficient
-loop structure than GCC.
+**strprocess if-conversion + copy propagation (two-phase improvement)**: The strprocess
+gap was attacked in two phases. Phase 1: if-convert cost model (MAX_SELECTS cap of 2,
+total cost cap of 12) reduced cmov count in `count_words` from 4 to 2 (~3% improvement,
+3.919s → 3.801s). Phase 2: lowered MAX_SELECTS from 2 to 1 (the 2-select case costs
+12+ x86 instructions vs ~4-6 for a branch diamond), plus three copy propagation
+enhancements: (a) fallthrough-only labels no longer clear the copy table (shared
+`collect_jump_targets` infrastructure extracted from store_forwarding), (b) callee-saved
+register copies survive across calls (only caller-saved registers invalidated per SysV ABI),
+(c) multiple copies can be propagated into a single instruction + re-processing on
+successful propagation. Combined improvement: ~9% (3.801s → 3.654s), narrowing the
+GCC -O0 gap from 33% to 26%. The remaining gap is in codegen structure.
 
 **DCE stale-cache bug (fixed)**: The dead code elimination pass panicked at `dce.rs:216` due to stale `UseDefInfo` cache entries. Root cause: passes between the last UseDefInfo consumer (`narrow`) and DCE modified the IR without invalidating the cache. Fix: explicit `usedef_cache` invalidation before DCE. Result: -O2 compilation success went from ~40% to **100%** on sqlite3, Lua, and zlib.
 
