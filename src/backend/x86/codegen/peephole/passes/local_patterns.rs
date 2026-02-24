@@ -645,12 +645,158 @@ fn is_reg_dead_after(infos: &[LineInfo], store: &LineStore, start: usize, len: u
 
 /// Extended liveness check that can look past conditional jumps, unconditional
 /// jumps, and fallthrough-only labels by following control flow. The `depth`
-/// parameter (default 2) limits recursion through branches/jumps.
+/// parameter limits recursion through branches/jumps.
 fn is_reg_dead_after_ext(
     infos: &[LineInfo], store: &LineStore, start: usize, len: usize, reg: u8,
     targets: &super::helpers::JumpTargets,
 ) -> bool {
-    is_reg_dead_scan(infos, store, start, len, reg, 24, 2, Some(targets))
+    is_reg_dead_scan(infos, store, start, len, reg, 24, 5, Some(targets))
+}
+
+/// Call-safe variant of is_reg_dead_after_ext for dead move elimination.
+/// Treats Calls as barriers (returns false) instead of assuming calls kill
+/// registers. This prevents incorrectly eliminating moves that set up
+/// function call arguments.
+pub(super) fn is_reg_unused_after_ext(
+    infos: &[LineInfo], store: &LineStore, start: usize, len: usize, reg: u8,
+    targets: &super::helpers::JumpTargets,
+) -> bool {
+    is_reg_dead_scan_call_safe(infos, store, start, len, reg, 24, 5, Some(targets))
+}
+
+/// Like is_reg_dead_scan but treats Calls as barriers (returns false).
+fn is_reg_dead_scan_call_safe(
+    infos: &[LineInfo], store: &LineStore, start: usize, len: usize,
+    reg: u8, max_scan: usize, depth: usize,
+    targets: Option<&super::helpers::JumpTargets>,
+) -> bool {
+    let reg_bit = 1u16 << reg;
+    let mut scanned = 0;
+    let mut k = start;
+    while k < len && scanned < max_scan {
+        if infos[k].is_nop() {
+            k += 1;
+            continue;
+        }
+
+        match infos[k].kind {
+            LineKind::Label => {
+                if let Some(tgt) = targets {
+                    let label_text = infos[k].trimmed(store.get(k));
+                    let is_jump_target = if let Some(n) = super::helpers::parse_label_number(label_text) {
+                        (n as usize) < tgt.is_jump_target.len() && tgt.is_jump_target[n as usize]
+                    } else {
+                        tgt.has_non_numeric_jump_targets
+                    };
+                    if !is_jump_target {
+                        k += 1;
+                        continue;
+                    }
+                    if depth > 0 {
+                        let dead_here = is_reg_dead_scan_call_safe(
+                            infos, store, k + 1, len, reg, 16, depth - 1, targets
+                        );
+                        if dead_here {
+                            k += 1;
+                            continue;
+                        }
+                    }
+                }
+                return false;
+            }
+            LineKind::Jmp => {
+                if depth > 0 {
+                    let trimmed = infos[k].trimmed(store.get(k));
+                    if let Some(target_label) = super::helpers::extract_jump_target(trimmed) {
+                        if let Some(tp) = find_label_pos(infos, store, len, target_label) {
+                            return is_reg_dead_scan_call_safe(
+                                infos, store, tp, len, reg, 16, depth - 1, targets
+                            );
+                        }
+                    }
+                }
+                return false;
+            }
+            LineKind::JmpIndirect => return false,
+            LineKind::CondJmp => {
+                if depth == 0 {
+                    return false;
+                }
+                let trimmed = infos[k].trimmed(store.get(k));
+                let target = super::helpers::extract_jump_target(trimmed);
+
+                // Fallthrough doesn't consume depth
+                let fall_dead = is_reg_dead_scan_call_safe(
+                    infos, store, k + 1, len, reg, 16, depth, targets
+                );
+                if !fall_dead {
+                    return false;
+                }
+
+                if let Some(target_label) = target {
+                    if let Some(tp) = find_label_pos(infos, store, len, target_label) {
+                        return is_reg_dead_scan_call_safe(
+                            infos, store, tp, len, reg, 16, depth - 1, targets
+                        );
+                    }
+                }
+                return false;
+            }
+            // Conservative: treat calls as barriers — the register might be
+            // read as a function argument.
+            LineKind::Call => return false,
+            LineKind::Ret => return reg != 0,
+            _ => {}
+        }
+
+        let refs_reg = infos[k].reg_refs & reg_bit != 0;
+        if refs_reg {
+            let dest = super::helpers::get_dest_reg(&infos[k]);
+            if dest == reg {
+                let trimmed = infos[k].trimmed(store.get(k));
+                if trimmed.starts_with("movq ") || trimmed.starts_with("movl ")
+                    || trimmed.starts_with("movb ") || trimmed.starts_with("movw ")
+                    || trimmed.starts_with("movabs")
+                    || trimmed.starts_with("xorl %eax, %eax")
+                    || trimmed.starts_with("movzbl ") || trimmed.starts_with("movzbq ")
+                    || trimmed.starts_with("movzwl ") || trimmed.starts_with("movzwq ")
+                    || trimmed.starts_with("movslq ") || trimmed.starts_with("movsbq ")
+                    || trimmed.starts_with("movsbl ")
+                {
+                    return true;
+                }
+                if trimmed.starts_with("leaq ") || trimmed.starts_with("leal ") {
+                    if let Some(comma_pos) = trimmed.rfind(", ") {
+                        let src_part = &trimmed[..comma_pos];
+                        let mut reg_in_src = false;
+                        for size_idx in 0..4 {
+                            let name = REG_NAMES[size_idx][reg as usize];
+                            if src_part.contains(name) {
+                                reg_in_src = true;
+                                break;
+                            }
+                        }
+                        if !reg_in_src {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if reg == 0 {
+            let trimmed = infos[k].trimmed(store.get(k));
+            if super::helpers::has_implicit_reg_usage(trimmed) {
+                return false;
+            }
+        }
+
+        scanned += 1;
+        k += 1;
+    }
+
+    false
 }
 
 /// Core liveness scan with depth-limited cross-block analysis.
@@ -722,15 +868,16 @@ fn is_reg_dead_scan(
                 let trimmed = infos[k].trimmed(store.get(k));
                 let target = super::helpers::extract_jump_target(trimmed);
 
-                // Fallthrough path
+                // Fallthrough path — doesn't consume depth since it's the
+                // natural code continuation (not a new code path).
                 let fall_dead = is_reg_dead_scan(
-                    infos, store, k + 1, len, reg, 16, depth - 1, targets
+                    infos, store, k + 1, len, reg, 16, depth, targets
                 );
                 if !fall_dead {
                     return false;
                 }
 
-                // Jump target path
+                // Jump target path — consumes depth (new code path)
                 if let Some(target_label) = target {
                     if let Some(tp) = find_label_pos(infos, store, len, target_label) {
                         return is_reg_dead_scan(
@@ -1127,7 +1274,6 @@ fn is_known_32bit_value(infos: &[LineInfo], store: &LineStore, pos: usize, reg: 
 pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
-    const RCX: u8 = 1; // register family 1 = rcx/ecx/cx/cl
 
     // Build jump target map to distinguish fallthrough-only labels from real targets.
     let targets = super::helpers::collect_jump_targets(store, infos, len);
@@ -1139,23 +1285,22 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
             continue;
         }
 
-        let trimmed_i = infos[i].trimmed(store.get(i));
-
-        // Match: movq %rN, %rcx (where %rN is a GP register, not %rcx itself)
-        let src_reg = match trimmed_i.strip_prefix("movq ") {
-            Some(rest) => match rest.strip_suffix(", %rcx") {
-                Some(src) if src.starts_with('%') && src != "%rcx" => {
-                    let fam = register_family_fast(src);
-                    if !is_valid_gp_reg(fam) || fam == RCX {
-                        i += 1;
-                        continue;
-                    }
-                    src
+        // Match: movq %rSrc, %rDst (any GP register pair, excluding rsp/rbp)
+        let (src_fam, dst_fam) = match infos[i].kind {
+            LineKind::Other { dest_reg } if is_valid_gp_reg(dest_reg)
+                && dest_reg != 4 && dest_reg != 5 =>
+            {
+                let trimmed_i = infos[i].trimmed(store.get(i));
+                match super::helpers::parse_reg_to_reg_movq(&infos[i], trimmed_i) {
+                    Some((s, d)) => (s, d),
+                    None => { i += 1; continue; }
                 }
-                _ => { i += 1; continue; }
-            },
-            None => { i += 1; continue; }
+            }
+            _ => { i += 1; continue; }
         };
+
+        let src_reg_name: &str = REG_NAMES[0][src_fam as usize]; // &'static str
+        let dst_reg_name: &str = REG_NAMES[0][dst_fam as usize]; // &'static str
 
         // Find next non-NOP instruction
         let mut j = i + 1;
@@ -1169,28 +1314,29 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
 
         let trimmed_j = infos[j].trimmed(store.get(j));
 
-        // Check that the instruction uses (%rcx) as a memory operand
-        // (contains "%rcx)" as a substring — covers (%rcx), N(%rcx), etc.)
-        if !trimmed_j.contains("%rcx)") {
+        // Check that the instruction uses %rDst as a memory base
+        // (contains "%rDst)" as a substring — covers (%rDst), N(%rDst), etc.)
+        let mem_pattern = format!("{})", dst_reg_name);
+        if !trimmed_j.contains(&mem_pattern) {
             i += 1;
             continue;
         }
 
-        // Trial replacement: replace %rcx) with %src) in the instruction text.
-        // Then verify %rcx doesn't appear elsewhere (as a non-memory operand).
-        let new_instr = trimmed_j.replace("%rcx)", &format!("{})", src_reg));
-        if new_instr.contains("%rcx") || new_instr.contains("%ecx")
-            || new_instr.contains("%cx") || new_instr.contains("%cl")
-        {
-            // %rcx still appears — used as a register operand too, can't fold
+        // Trial replacement: replace %rDst) with %rSrc) in the instruction text.
+        let new_instr = trimmed_j.replace(&mem_pattern, &format!("{})", src_reg_name));
+
+        // Verify %rDst doesn't appear elsewhere (as a non-memory register operand).
+        let has_other_ref = (0..4).any(|size_idx| {
+            let name = REG_NAMES[size_idx][dst_fam as usize];
+            new_instr.contains(name)
+        });
+        if has_other_ref {
             i += 1;
             continue;
         }
 
-        // Check that %rcx is dead after the memory instruction.
-        // Use extended liveness with jump target analysis to look past
-        // conditional jumps and fallthrough-only labels.
-        if !is_reg_dead_after_ext(infos, store, j + 1, len, RCX, &targets) {
+        // Check that %rDst is dead after the memory instruction.
+        if !is_reg_dead_after_ext(infos, store, j + 1, len, dst_fam, &targets) {
             i += 1;
             continue;
         }
@@ -1203,6 +1349,539 @@ pub(super) fn fold_address_through_secondary(store: &mut LineStore, infos: &mut 
         i = j + 1;
     }
     changed
+}
+
+// ── Double-register add to LEA fold ─────────────────────────────────────────
+//
+// When a register is copied and then added to itself, producing a multiply-by-2,
+// the movq + addq can be replaced with a single LEA:
+//
+//   movq %rA, %rB; addq %rA, %rB → leaq (%rA, %rA), %rB
+//
+// LEA doesn't set flags, so this is only safe when the addq's flags are dead
+// (overwritten before being consumed).
+
+pub(super) fn fold_double_to_leaq(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Match: movq %rA, %rB
+        let (src_a, dst_b) = match infos[i].kind {
+            LineKind::Other { dest_reg } if is_valid_gp_reg(dest_reg)
+                && dest_reg != 4 && dest_reg != 5 =>
+            {
+                let trimmed = infos[i].trimmed(store.get(i));
+                match super::helpers::parse_reg_to_reg_movq(&infos[i], trimmed) {
+                    Some((s, d)) => (s, d),
+                    None => { i += 1; continue; }
+                }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Find next non-NOP instruction
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        // Match: addq %rA, %rB (same source register, same destination)
+        if !matches!(infos[j].kind, LineKind::Other { dest_reg } if dest_reg == dst_b) {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_j = infos[j].trimmed(store.get(j));
+        let addq_match = if let Some(rest) = trimmed_j.strip_prefix("addq ") {
+            if let Some((src, dst)) = rest.split_once(", ") {
+                let src = src.trim();
+                let dst = dst.trim();
+                register_family_fast(src) == src_a && register_family_fast(dst) == dst_b
+            } else { false }
+        } else { false };
+
+        if !addq_match {
+            i += 1;
+            continue;
+        }
+
+        // Check: flags from addq are dead (will be overwritten before use)
+        if !are_flags_dead_after(infos, store, j + 1, len, None) {
+            i += 1;
+            continue;
+        }
+
+        // Build replacement LEA
+        let src_name = REG_NAMES[0][src_a as usize];
+        let dst_name = REG_NAMES[0][dst_b as usize];
+        let new_text = format!("    leaq ({}, {}), {}", src_name, src_name, dst_name);
+
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_text);
+        changed = true;
+        i = j + 1;
+    }
+
+    changed
+}
+
+/// Check if CPU flags are dead (will be overwritten before being read) starting
+/// from position `start`. Scans forward looking for the next flag-relevant
+/// instruction and returns true if it sets (rather than reads) flags.
+/// When `targets` is provided, non-jump-target labels are safely skipped.
+fn are_flags_dead_after(
+    infos: &[LineInfo], store: &LineStore, start: usize, len: usize,
+    _targets: Option<&super::helpers::JumpTargets>,
+) -> bool {
+    let scan_end = (start + 24).min(len);
+    let mut k = start;
+    while k < scan_end {
+        if infos[k].is_nop() {
+            k += 1;
+            continue;
+        }
+
+        // Cmp/test always sets flags → previous flags dead
+        if infos[k].kind == LineKind::Cmp {
+            return true;
+        }
+
+        // Labels: always skip. Flag liveness is forward-only: "does the code
+        // from here forward consume flags before setting new ones?" This question
+        // is the same regardless of which path reached this label. Both jump-target
+        // and fallthrough-only labels are safe to scan past.
+        if infos[k].kind == LineKind::Label {
+            k += 1;
+            continue;
+        }
+
+        // Other control flow barriers → conservative
+        if infos[k].is_barrier() {
+            return false;
+        }
+
+        // CondJmp and SetCC consume flags
+        if infos[k].kind == LineKind::CondJmp { return false; }
+        if matches!(infos[k].kind, LineKind::SetCC { .. }) { return false; }
+
+        let trimmed = infos[k].trimmed(store.get(k));
+
+        // cmov reads flags
+        if trimmed.starts_with("cmov") { return false; }
+        // adc/sbb read carry flag
+        if trimmed.starts_with("adc") || trimmed.starts_with("sbb") { return false; }
+
+        // Flag-preserving instructions: mov, lea, push, pop → continue
+        let b = trimmed.as_bytes();
+        if b.len() >= 3 {
+            if (b[0] == b'm' && b[1] == b'o' && b[2] == b'v')
+                || (b[0] == b'l' && b[1] == b'e' && b[2] == b'a')
+            {
+                k += 1;
+                continue;
+            }
+        }
+        if trimmed.starts_with("pushq ") || trimmed.starts_with("popq ") {
+            k += 1;
+            continue;
+        }
+
+        // Any other instruction (add, sub, and, or, xor, shl, shr, etc.)
+        // likely sets flags → previous flags dead
+        return true;
+    }
+    false // conservative: couldn't determine
+}
+
+// ── movq + addq $imm → leaq fold ────────────────────────────────────────────
+//
+// When a register is copied and then an immediate is added to the copy,
+// the movq + addq can be replaced with a single LEA (which doesn't set flags):
+//
+//   movq %rA, %rB
+//   addq $IMM, %rB     →   leaq IMM(%rA), %rB
+//
+// Also handles subq:
+//   movq %rA, %rB
+//   subq $IMM, %rB     →   leaq -IMM(%rA), %rB
+
+pub(super) fn fold_movq_addimm_to_leaq(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: movq %rA, %rB
+        let (src_a, dst_b) = match infos[i].kind {
+            LineKind::Other { dest_reg } if is_valid_gp_reg(dest_reg)
+                && dest_reg != 4 && dest_reg != 5 =>
+            {
+                let trimmed = infos[i].trimmed(store.get(i));
+                match super::helpers::parse_reg_to_reg_movq(&infos[i], trimmed) {
+                    Some((s, d)) => (s, d),
+                    None => { i += 1; continue; }
+                }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Find next non-NOP
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        // Match: addq $IMM, %rB or subq $IMM, %rB (same destination as movq)
+        if !matches!(infos[j].kind, LineKind::Other { dest_reg } if dest_reg == dst_b) {
+            i += 1; continue;
+        }
+
+        let trimmed_j = infos[j].trimmed(store.get(j));
+        let imm_val: Option<i64> = if let Some(rest) = trimmed_j.strip_prefix("addq $") {
+            if let Some((imm_s, dst_s)) = rest.split_once(", ") {
+                let dst_s = dst_s.trim();
+                if register_family_fast(dst_s) == dst_b {
+                    imm_s.trim().parse::<i64>().ok()
+                } else { None }
+            } else { None }
+        } else if let Some(rest) = trimmed_j.strip_prefix("subq $") {
+            if let Some((imm_s, dst_s)) = rest.split_once(", ") {
+                let dst_s = dst_s.trim();
+                if register_family_fast(dst_s) == dst_b {
+                    imm_s.trim().parse::<i64>().ok().map(|v| -v)
+                } else { None }
+            } else { None }
+        } else { None };
+
+        let imm = match imm_val {
+            Some(v) => v,
+            None => { i += 1; continue; }
+        };
+
+        // Check: flags from addq/subq are dead
+        if !are_flags_dead_after(infos, store, j + 1, len, Some(&targets)) {
+            i += 1; continue;
+        }
+
+        // Build replacement LEA
+        let src_name = REG_NAMES[0][src_a as usize];
+        let dst_name = REG_NAMES[0][dst_b as usize];
+        let new_text = format!("    leaq {}({}), {}", imm, src_name, dst_name);
+
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_text);
+        changed = true;
+        i = j + 1;
+    }
+
+    changed
+}
+
+// ── Scaled address into memory operand fold ─────────────────────────────────
+//
+// Folds address computation chains into x86 addressing modes:
+//
+// Pattern 1 (3-instruction, saves 2):
+//   leaq (%rA, %rA), %rT    ; rT = rA * 2
+//   addq %rT, %rB           ; rB = rB + rA*2
+//   <mem_op> (%rB), %rC     ; load/store using rB
+//   →
+//   <mem_op> (%rB, %rA, 2), %rC  ; fold scaled address into operand
+//
+// Pattern 2 (2-instruction, saves 1):
+//   addq %rT, %rB           ; rB = rB + rT
+//   <mem_op> (%rB), %rC     ; load/store using rB
+//   →
+//   <mem_op> (%rB, %rT), %rC     ; fold simple address into operand
+//
+// Conditions: modified rB dead after mem_op, addq flags dead, temps dead.
+
+pub(super) fn fold_scaled_address_into_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: addq %rSrc, %rDst (register-to-register, src != dst)
+        let trimmed_i = infos[i].trimmed(store.get(i));
+        let (add_src, add_dst) = match parse_addq_reg_reg(trimmed_i) {
+            Some((s, d)) => (s, d),
+            None => { i += 1; continue; }
+        };
+
+        // Find next non-NOP instruction
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        // Must not be a barrier, label, or jump
+        if infos[j].is_barrier() { i += 1; continue; }
+        match infos[j].kind {
+            LineKind::Label | LineKind::Jmp | LineKind::CondJmp | LineKind::Call => {
+                i += 1; continue;
+            }
+            _ => {}
+        }
+
+        // Check: instruction j uses (%rB) as a simple memory base (no index/scale)
+        let trimmed_j_owned = infos[j].trimmed(store.get(j)).to_string();
+        let trimmed_j = trimmed_j_owned.as_str();
+        let base_name = REG_NAMES[0][add_dst as usize];
+        let base_pattern = format!("({})", base_name);
+        if !trimmed_j.contains(&base_pattern) { i += 1; continue; }
+
+        // Safety: if mem_op writes to add_dst (the base register), it must be
+        // a pure overwrite (mov/lea) — NOT a read-modify-write like addq.
+        let mem_dest = super::helpers::get_dest_reg(&infos[j]);
+        if mem_dest == add_dst {
+            if !trimmed_j.starts_with("mov") && !trimmed_j.starts_with("lea") {
+                i += 1; continue;
+            }
+        }
+
+        // Check: flags from addq are dead (not consumed before overwritten)
+        if !are_flags_dead_after(infos, store, j, len, Some(&targets)) { i += 1; continue; }
+
+        // Check: modified rB (= rB_orig + rT) is dead after mem_op
+        let modified_rb_dead = if mem_dest == add_dst {
+            true // mem_op overwrites rB
+        } else {
+            is_reg_dead_after_ext(infos, store, j + 1, len, add_dst, &targets)
+        };
+        if !modified_rb_dead { i += 1; continue; }
+
+        // Try 3-instruction fold: look back for leaq (%rA, %rA), %rT
+        let mut did_three_fold = false;
+        if i > 0 {
+            let mut pi = i.saturating_sub(1);
+            while pi > 0 && infos[pi].is_nop() { pi -= 1; }
+            if !infos[pi].is_nop() {
+                let trimmed_pi = infos[pi].trimmed(store.get(pi));
+                if let Some((reg_a, dst_t)) = parse_leaq_double(trimmed_pi) {
+                    // leaq wrote to dst_t, which must be the addq source
+                    // reg_a must not be add_dst (since addq modified it)
+                    if dst_t == add_src && reg_a != add_dst && reg_a != add_src {
+                        // Check: add_src (rT) is safe to eliminate
+                        let add_src_safe = mem_dest == add_src
+                            || is_reg_dead_after_ext(
+                                infos, store, j + 1, len, add_src, &targets,
+                            );
+                        if add_src_safe {
+                            let index_name = REG_NAMES[0][reg_a as usize];
+                            let new_mem = format!("({}, {}, 2)", base_name, index_name);
+                            let new_text = format!(
+                                "    {}", trimmed_j.replace(&base_pattern, &new_mem)
+                            );
+                            mark_nop(&mut infos[pi]); // NOP leaq
+                            mark_nop(&mut infos[i]);  // NOP addq
+                            replace_line(store, &mut infos[j], j, new_text);
+                            changed = true;
+                            did_three_fold = true;
+                            i = j + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if did_three_fold { continue; }
+
+        // 2-instruction fold: addq + mem → mem with index register
+        let index_name = REG_NAMES[0][add_src as usize];
+        let new_mem = format!("({}, {})", base_name, index_name);
+        let new_text = format!("    {}", trimmed_j.replace(&base_pattern, &new_mem));
+        mark_nop(&mut infos[i]); // NOP addq
+        replace_line(store, &mut infos[j], j, new_text);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Parse `leaq (%rA, %rA), %rT` where both registers in parens are the same.
+/// Returns Some((rA_family, rT_family)).
+fn parse_leaq_double(trimmed: &str) -> Option<(RegId, RegId)> {
+    let rest = trimmed.strip_prefix("leaq (")?;
+    let (inner, after) = rest.split_once(')')?;
+    let after = after.strip_prefix(", ")?;
+    let dst = after.trim();
+    let dst_fam = register_family_fast(dst);
+    if dst_fam == REG_NONE || dst_fam > REG_GP_MAX || dst_fam == 4 || dst_fam == 5 {
+        return None;
+    }
+    let (reg1, reg2) = inner.split_once(", ")?;
+    let reg1 = reg1.trim();
+    let reg2 = reg2.trim();
+    let fam1 = register_family_fast(reg1);
+    let fam2 = register_family_fast(reg2);
+    if fam1 == REG_NONE || fam1 > REG_GP_MAX || fam1 != fam2 {
+        return None;
+    }
+    if fam1 == 4 || fam1 == 5 { return None; }
+    Some((fam1, dst_fam))
+}
+
+/// Parse `addq %rSrc, %rDst` → Some((src_family, dst_family)).
+/// Both must be GP registers, not rsp/rbp, and src != dst.
+fn parse_addq_reg_reg(trimmed: &str) -> Option<(RegId, RegId)> {
+    let rest = trimmed.strip_prefix("addq ")?;
+    let (src, dst) = rest.split_once(", ")?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if !src.starts_with('%') || !dst.starts_with('%') {
+        return None;
+    }
+    let sfam = register_family_fast(src);
+    let dfam = register_family_fast(dst);
+    if sfam == REG_NONE || sfam > REG_GP_MAX || sfam == 4 || sfam == 5 {
+        return None;
+    }
+    if dfam == REG_NONE || dfam > REG_GP_MAX || dfam == 4 || dfam == 5 {
+        return None;
+    }
+    if sfam == dfam { return None; }
+    Some((sfam, dfam))
+}
+
+// ── Commutative binop through temp fold ─────────────────────────────────────
+//
+// When a commutative binary operation uses a temporary register to swap
+// operands, the entire save/overwrite/binop sequence can be replaced with
+// a single binop using the original operands:
+//
+//   movq %rA, %rT       ; save rA in temp
+//   movq %rB, %rA       ; overwrite rA with rB
+//   addq %rT, %rA       ; rA = rB + rA_orig = rA_orig + rB (commutative)
+//   →
+//   addq %rB, %rA       ; rA = rA + rB (same result, when %rT dead)
+
+pub(super) fn fold_commutative_through_temp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = super::helpers::collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i + 2 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Match: movq %rA, %rT
+        let (src_a, temp_reg) = match infos[i].kind {
+            LineKind::Other { dest_reg } if is_valid_gp_reg(dest_reg)
+                && dest_reg != 4 && dest_reg != 5 =>
+            {
+                let trimmed = infos[i].trimmed(store.get(i));
+                match super::helpers::parse_reg_to_reg_movq(&infos[i], trimmed) {
+                    Some((s, d)) => (s, d),
+                    None => { i += 1; continue; }
+                }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Find next two non-NOP instructions
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() { k += 1; }
+        if k >= len { i += 1; continue; }
+
+        // Match: movq %rB, %rA (overwrite the source of the first movq)
+        let src_b = match infos[j].kind {
+            LineKind::Other { dest_reg } if dest_reg == src_a => {
+                let trimmed = infos[j].trimmed(store.get(j));
+                match super::helpers::parse_reg_to_reg_movq(&infos[j], trimmed) {
+                    Some((sb, _da)) if sb != src_a && sb != temp_reg => sb,
+                    _ => { i += 1; continue; }
+                }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Match: commutative binop %rT, %rA at position k
+        if !matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == src_a) {
+            i += 1;
+            continue;
+        }
+
+        let trimmed_k = infos[k].trimmed(store.get(k));
+        let (op, op_src, op_dst) = match parse_binop_reg_reg(trimmed_k) {
+            Some(v) => v,
+            None => { i += 1; continue; }
+        };
+
+        if op_src != temp_reg || op_dst != src_a {
+            i += 1;
+            continue;
+        }
+
+        if !is_commutative_op(op) {
+            i += 1;
+            continue;
+        }
+
+        // Check: %rT is dead after the binop
+        if !is_reg_dead_after_ext(infos, store, k + 1, len, temp_reg, &targets) {
+            i += 1;
+            continue;
+        }
+
+        // Build replacement: replace temp_reg family with src_b family in the binop
+        let new_instr = super::helpers::replace_reg_family(trimmed_k, temp_reg, src_b);
+        let new_text = format!("    {}", new_instr);
+
+        mark_nop(&mut infos[i]);
+        mark_nop(&mut infos[j]);
+        replace_line(store, &mut infos[k], k, new_text);
+        changed = true;
+        i = k + 1;
+    }
+
+    changed
+}
+
+/// Parse `<opcode> %src, %dst` binary operation with two register operands.
+fn parse_binop_reg_reg(trimmed: &str) -> Option<(&str, RegId, RegId)> {
+    let space_pos = trimmed.find(' ')?;
+    let opcode = &trimmed[..space_pos];
+    let rest = &trimmed[space_pos + 1..];
+
+    let (src, dst) = rest.split_once(", ")?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
+        return None;
+    }
+    let sfam = register_family_fast(src);
+    let dfam = register_family_fast(dst);
+    if sfam == REG_NONE || sfam > REG_GP_MAX || dfam == REG_NONE || dfam > REG_GP_MAX {
+        return None;
+    }
+    Some((opcode, sfam, dfam))
+}
+
+/// Check if a binary operation is commutative (a op b = b op a).
+fn is_commutative_op(op: &str) -> bool {
+    matches!(op, "addq" | "addl" | "addw"
+        | "orq" | "orl" | "orw"
+        | "xorq" | "xorl" | "xorw"
+        | "andq" | "andl" | "andw"
+        | "imulq" | "imull")
 }
 
 // ── Accumulator routing fold ────────────────────────────────────────────────

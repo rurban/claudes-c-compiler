@@ -140,6 +140,57 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
     changed
 }
 
+// ── Extended dead register move elimination ──────────────────────────────────
+//
+// Like eliminate_dead_reg_moves but uses extended liveness analysis (depth=5)
+// to prove dead moves across conditional jumps and labels. Uses the call-safe
+// variant that treats function calls as barriers, preventing incorrect
+// elimination of argument-setup moves.
+
+pub(super) fn eliminate_dead_reg_moves_ext(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let targets = collect_jump_targets(store, infos, len);
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+
+        let dst_reg = match infos[i].kind {
+            LineKind::Other { dest_reg } => {
+                let trimmed = infos[i].trimmed(store.get(i));
+                if parse_reg_to_reg_movq(&infos[i], trimmed).is_some() {
+                    dest_reg
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if dst_reg == REG_NONE || dst_reg > REG_GP_MAX || dst_reg == 4 || dst_reg == 5 {
+            i += 1;
+            continue;
+        }
+
+        if super::local_patterns::is_reg_unused_after_ext(infos, store, i + 1, len, dst_reg, &targets) {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
 // ── Dead store elimination (local, windowed) ─────────────────────────────────
 
 pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
