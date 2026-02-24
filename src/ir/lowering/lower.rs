@@ -53,6 +53,10 @@ pub struct Lowerer {
     pub(super) target: Target,
     pub(super) next_label: u32,
     pub(super) next_string: u32,
+    /// Deduplication map for string literals: maps string content to its label.
+    /// When the same string literal appears multiple times, they share the same
+    /// .rodata entry (matching GCC's -fmerge-constants default behavior).
+    pub(super) string_dedup: FxHashMap<String, String>,
     pub(super) next_anon_struct: u32,
     /// Counter for unique static local variable names
     pub(super) next_static_local: u32,
@@ -191,6 +195,7 @@ impl Lowerer {
             target,
             next_label: 0,
             next_string: 0,
+            string_dedup: FxHashMap::default(),
             next_anon_struct: 0,
             next_static_local: 0,
             module: IrModule::new(),
@@ -1055,10 +1060,15 @@ impl Lowerer {
     }
 
     /// Intern a string literal: add it to the module's .rodata string table and
-    /// return its unique label.
+    /// return its unique label. Deduplicates identical strings so they share
+    /// the same .rodata entry (matching GCC's -fmerge-constants behavior).
     pub(super) fn intern_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing_label) = self.string_dedup.get(s) {
+            return existing_label.clone();
+        }
         let label = format!(".Lstr{}", self.next_string);
         self.next_string += 1;
+        self.string_dedup.insert(s.to_string(), label.clone());
         self.module.string_literals.push((label.clone(), s.to_string()));
         label
     }
