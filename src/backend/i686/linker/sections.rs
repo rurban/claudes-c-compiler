@@ -63,7 +63,7 @@ pub(super) fn merge_sections(
                 out_sec.align = align;
             }
             let padding = (align - (out_sec.data.len() as u32 % align)) % align;
-            out_sec.data.extend(std::iter::repeat_n(0u8, padding as usize));
+            out_sec.data.extend(std::iter::repeat(0u8).take(padding as usize));
             let offset = out_sec.data.len() as u32;
 
             section_map.insert((obj_idx, sec.input_index), (out_idx, offset));
@@ -71,7 +71,7 @@ pub(super) fn merge_sections(
             if sec.sh_type != SHT_NOBITS {
                 out_sec.data.extend_from_slice(&sec.data);
             } else {
-                out_sec.data.extend(std::iter::repeat_n(0u8, sec.data.len()));
+                out_sec.data.extend(std::iter::repeat(0u8).take(sec.data.len()));
             }
         }
     }

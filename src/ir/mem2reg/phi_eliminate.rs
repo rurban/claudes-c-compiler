@@ -490,7 +490,7 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             let num_copies = copies.len();
             block.instructions.extend(copies);
             if !block.source_spans.is_empty() {
-                block.source_spans.extend(std::iter::repeat_n(crate::common::source::Span::dummy(), num_copies));
+                block.source_spans.extend(std::iter::repeat(crate::common::source::Span::dummy()).take(num_copies));
             }
         }
     }

@@ -36,7 +36,7 @@ impl ConditionalStack {
 
     /// Returns true if code should currently be emitted.
     pub fn is_active(&self) -> bool {
-        self.stack.last().is_none_or(|s| s.current_branch_active && s.parent_active)
+        self.stack.last().map_or(true, |s| s.current_branch_active && s.parent_active)
     }
 
     /// Push a new #if/#ifdef/#ifndef.

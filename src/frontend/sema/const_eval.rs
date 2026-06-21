@@ -236,8 +236,7 @@ impl<'a> SemaConstEval<'a> {
                 if target_size == 16 && !matches!(&target_ctype, CType::LongDouble) {
                     // Determine source signedness: try type map first, then infer, default signed
                     let src_signed = self.lookup_expr_type(inner)
-                        .or_else(|| self.infer_expr_ctype(inner))
-                        .is_none_or(|ct| !ct.is_unsigned());
+                        .or_else(|| self.infer_expr_ctype(inner)).map_or(true, |ct| !ct.is_unsigned());
                     let v128 = if src_signed {
                         // Sign-extend: u64 -> i64 (reinterpret) -> i128 (sign-extend)
                         (bits as i64) as i128
@@ -263,8 +262,7 @@ impl<'a> SemaConstEval<'a> {
                 // 18446744073709551615.0, not -1.0.
                 if matches!(target_ctype, CType::Float | CType::Double | CType::LongDouble) {
                     let src_signed = self.lookup_expr_type(inner)
-                        .or_else(|| self.infer_expr_ctype(inner))
-                        .is_none_or(|ct| !ct.is_unsigned());
+                        .or_else(|| self.infer_expr_ctype(inner)).map_or(true, |ct| !ct.is_unsigned());
                     return self.bits_to_irconst(truncated, &target_ctype, src_signed);
                 }
 

@@ -721,8 +721,7 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                         // If the label isn't found in this snippet (external target),
                         // assume it's in range since the unconditional branch already
                         // reached it, and b.cond has ±1MB range which is generous.
-                        let in_range = estimate_branch_distance(lines, kinds, i, real_target)
-                            .is_none_or(|d| d < COND_BRANCH_SAFE_DISTANCE);
+                        let in_range = estimate_branch_distance(lines, kinds, i, real_target).map_or(true, |d| d < COND_BRANCH_SAFE_DISTANCE);
                         if in_range {
                             if let Some(inv_cc) = invert_condition(cc) {
                                 // Replace conditional branch with inverted condition to real target

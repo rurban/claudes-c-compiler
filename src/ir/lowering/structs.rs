@@ -574,7 +574,7 @@ impl Lowerer {
                 }
                 // Small struct (<= 8 bytes): produces packed data unless somehow sret
                 if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    self.func_meta.sigs.get(&**name).is_none_or(|s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
+                    self.func_meta.sigs.get(&**name).map_or(true, |s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
                 } else {
                     true
                 }

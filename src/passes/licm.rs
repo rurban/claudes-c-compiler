@@ -825,7 +825,7 @@ fn hoist_loop_invariants(
         preheader_block.instructions.extend(sorted);
         if !preheader_block.source_spans.is_empty() {
             preheader_block.source_spans.extend(
-                std::iter::repeat_n(crate::common::source::Span::dummy(), num_sorted)
+                std::iter::repeat(crate::common::source::Span::dummy()).take(num_sorted)
             );
         }
     }

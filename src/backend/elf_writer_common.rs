@@ -456,9 +456,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         });
                     }
                     if section.flags & SHF_EXECINSTR != 0 {
-                        section.data.extend(std::iter::repeat_n(0x90, padding));
+                        section.data.extend(std::iter::repeat(0x90).take(padding));
                     } else {
-                        section.data.extend(std::iter::repeat_n(0, padding));
+                        section.data.extend(std::iter::repeat(0).take(padding));
                     }
                 }
             }
@@ -477,7 +477,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             AsmItem::Zero(n) => {
                 self.ensure_section()?;
                 let section = self.current_section_mut()?;
-                section.data.extend(std::iter::repeat_n(0u8, *n as usize));
+                section.data.extend(std::iter::repeat(0u8).take(*n as usize));
             }
             AsmItem::Org(sym, offset) => {
                 self.process_org(sym, *offset)?;
@@ -492,7 +492,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // Simple integer parse for architectures without deferred skip support
                     if let Ok(val) = expr.trim().parse::<u64>() {
                         let section = self.current_section_mut()?;
-                        section.data.extend(std::iter::repeat_n(*fill, val as usize));
+                        section.data.extend(std::iter::repeat(*fill).take(val as usize));
                     } else {
                         return Err(format!("unsupported .skip expression: {}", expr));
                     }
@@ -599,7 +599,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
         if padding > 0 {
             let fill = if self.sections[sec_idx].flags & SHF_EXECINSTR != 0 { 0x90u8 } else { 0u8 };
-            self.sections[sec_idx].data.extend(std::iter::repeat_n(fill, padding));
+            self.sections[sec_idx].data.extend(std::iter::repeat(fill).take(padding));
         }
         Ok(())
     }
@@ -692,7 +692,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     patch_size: size as u8,
                                 });
                                 let section = &mut self.sections[sec_idx];
-                                section.data.extend(std::iter::repeat_n(0, size));
+                                section.data.extend(std::iter::repeat(0).take(size));
                                 continue;
                             }
                         }
@@ -707,7 +707,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         patch_size: size as u8,
                     });
                     let section = &mut self.sections[sec_idx];
-                    section.data.extend(std::iter::repeat_n(0, size));
+                    section.data.extend(std::iter::repeat(0).take(size));
                 }
                 DataValue::SymbolOffset(sym, addend) => {
                     let offset = self.sections[sec_idx].data.len() as u64;
@@ -720,7 +720,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         patch_size: size as u8,
                     });
                     let section = &mut self.sections[sec_idx];
-                    section.data.extend(std::iter::repeat_n(0, size));
+                    section.data.extend(std::iter::repeat(0).take(size));
                 }
                 DataValue::SymbolDiff(a, b) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, 0)?;
@@ -749,14 +749,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 patch_size: size as u8,
             });
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.data.extend(std::iter::repeat(0).take(size));
         } else if size <= 2 && A::supports_deferred_skips() {
             // For byte/short-sized diffs, defer resolution until after
             // deferred skips are inserted (skip insertion shifts offsets).
             let offset_usize = self.sections[sec_idx].data.len();
             self.deferred_byte_diffs.push((sec_idx, offset_usize, a_resolved, b_resolved, size, addend));
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.data.extend(std::iter::repeat(0).take(size));
         } else {
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
@@ -767,7 +767,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 patch_size: size as u8,
             });
             let section = &mut self.sections[sec_idx];
-            section.data.extend(std::iter::repeat_n(0, size));
+            section.data.extend(std::iter::repeat(0).take(size));
         }
         Ok(())
     }

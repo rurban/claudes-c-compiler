@@ -153,9 +153,9 @@ impl ElfWriterBase {
                 for _ in 0..full_nops {
                     section.data.extend_from_slice(&self.nop_bytes);
                 }
-                section.data.extend(std::iter::repeat_n(0u8, remainder));
+                section.data.extend(std::iter::repeat(0u8).take(remainder));
             } else {
-                section.data.extend(std::iter::repeat_n(0u8, padding));
+                section.data.extend(std::iter::repeat(0u8).take(padding));
             }
             if align > section.sh_addralign {
                 section.sh_addralign = align;
