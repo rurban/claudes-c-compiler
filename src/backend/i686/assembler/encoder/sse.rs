@@ -168,7 +168,7 @@ impl super::InstructionEncoder {
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
-            (Operand::Register(src), Operand::Register(dst)) if is_xmm(&src.name) => {
+            (Operand::Register(src), Operand::Register(_dst)) if is_xmm(&src.name) => {
                 self.encode_sse_op(&[ops[0].clone(), ops[1].clone()], _reg_opcode)
             }
             _ => Err("unsupported SSE shift operands".to_string()),

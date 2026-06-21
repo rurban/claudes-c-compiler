@@ -236,6 +236,7 @@ impl UseDefInfo {
     }
 
     /// Check if a value has no uses (use_count == 0).
+    #[allow(dead_code)]
     #[inline]
     pub fn is_dead(&self, v: u32) -> bool {
         let idx = v as usize;
@@ -244,6 +245,7 @@ impl UseDefInfo {
 
     /// Look up the instruction defining a value. Returns `None` if the value
     /// is a parameter, has no recorded definition, or is out of bounds.
+    #[allow(dead_code)]
     #[inline]
     pub fn def_inst<'a>(&self, v: u32, func: &'a IrFunction) -> Option<&'a Instruction> {
         let idx = v as usize;
@@ -269,6 +271,7 @@ impl UseDefInfo {
 
     /// Look up the instruction at a UseLoc. Returns `None` if the UseLoc
     /// refers to a terminator or is out of bounds.
+    #[allow(dead_code)]
     #[inline]
     pub fn use_inst<'a>(&self, loc: UseLoc, func: &'a IrFunction) -> Option<&'a Instruction> {
         if loc.is_terminator() {
@@ -280,6 +283,7 @@ impl UseDefInfo {
 
     /// Look up the terminator at a UseLoc. Returns `None` if the UseLoc
     /// refers to an instruction (not a terminator) or is out of bounds.
+    #[allow(dead_code)]
     #[inline]
     pub fn use_terminator<'a>(&self, loc: UseLoc, func: &'a IrFunction) -> Option<&'a Terminator> {
         if !loc.is_terminator() {
